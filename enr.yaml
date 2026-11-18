@@ -1,0 +1,9 @@
+runtime:
+  preferred_backend: cpu
+  model_directories:
+    - /home/petr/git/evo-native-runtime-161126/enr-model-loader/src/test/resources/models
+  max_concurrent_sessions: 8
+  default_max_tokens: 32
+server:
+  host: 127.0.0.1
+  port: 8111
