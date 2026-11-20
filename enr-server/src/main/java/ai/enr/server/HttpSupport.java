@@ -30,6 +30,11 @@ public final class HttpSupport {
         return Json.parse(body);
     }
 
+    public static JsonObject parseBodyObject(HttpExchange exchange) throws IOException {
+        JsonValue body = parseBody(exchange);
+        return body instanceof JsonObject obj ? obj : new JsonObject();
+    }
+
     public static void sendJson(HttpExchange exchange, int status, JsonValue body) throws IOException {
         byte[] bytes = Json.write(body, false).getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -73,5 +78,39 @@ public final class HttpSupport {
         sb.append('\n');
         out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
         out.flush();
+    }
+
+    /** Writes one newline-delimited JSON line (Ollama streaming format). */
+    public static void sendNdJson(OutputStream out, JsonObject data) throws IOException {
+        out.write((Json.write(data, false) + "\n").getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    /** Writes one OpenAI-style SSE data frame. */
+    public static void sendSseData(OutputStream out, JsonObject data) throws IOException {
+        out.write(("data: " + Json.write(data, false) + "\n\n").getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    /**
+     * Bearer-token check for administration endpoints. Returns true when the
+     * request is authorized (no token configured, or matching Authorization
+     * header); false when rejected.
+     */
+    public static boolean authorized(HttpExchange exchange, String token) {
+        if (token == null || token.isBlank()) {
+            return true;
+        }
+        String header = exchange.getRequestHeaders().getFirst("Authorization");
+        if (header != null && header.startsWith("Bearer ")) {
+            return java.security.MessageDigest.isEqual(
+                    token.getBytes(StandardCharsets.UTF_8),
+                    header.substring(7).getBytes(StandardCharsets.UTF_8));
+        }
+        return false;
+    }
+
+    public static void sendUnauthorized(HttpExchange exchange) throws IOException {
+        sendError(exchange, 401, "UNAUTHORIZED", "Missing or invalid Bearer token");
     }
 }

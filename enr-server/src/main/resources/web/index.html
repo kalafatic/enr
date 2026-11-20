@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ENR Control Center</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">ENR</span>
+    <span class="subtitle">Control Center</span>
+  </div>
+  <nav id="nav">
+    <a href="#dashboard" data-page="dashboard">Dashboard</a>
+    <a href="#models" data-page="models">Models</a>
+    <a href="#providers" data-page="providers">Providers</a>
+    <a href="#runtime" data-page="runtime">Runtime</a>
+    <a href="#playground" data-page="playground">Playground</a>
+    <a href="#diagnostics" data-page="diagnostics">Diagnostics</a>
+  </nav>
+  <div class="header-right">
+    <span id="conn-dot" class="dot" title="connection"></span>
+    <button id="token-btn" class="btn small hidden" title="Authentication">Key</button>
+  </div>
+</header>
+
+<main id="main"></main>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modal-cancel">Close</button>
+      <button class="btn primary" id="modal-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

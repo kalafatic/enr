@@ -6,7 +6,7 @@
 
   <groupId>ai.enr</groupId>
   <artifactId>enr-parent</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+  <version>2.6.11-SNAPSHOT</version>
   <packaging>pom</packaging>
 
   <name>EVO Native Runtime (ENR)</name>
@@ -16,7 +16,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>21</maven.compiler.release>
     <junit.version>5.10.2</junit.version>
-    <enr.version>1.0.0-SNAPSHOT</enr.version>
+    <enr.version>2.6.11-SNAPSHOT</enr.version>
   </properties>
 
   <modules>
@@ -28,6 +28,7 @@
     <module>enr-compute-cuda</module>
     <module>enr-inference</module>
     <module>enr-runtime</module>
+    <module>enr-manager</module>
     <module>enr-server</module>
     <module>enr-java-api</module>
     <module>enr-cli</module>
@@ -74,6 +75,11 @@
       <dependency>
         <groupId>ai.enr</groupId>
         <artifactId>enr-runtime</artifactId>
+        <version>${enr.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>ai.enr</groupId>
+        <artifactId>enr-manager</artifactId>
         <version>${enr.version}</version>
       </dependency>
       <dependency>

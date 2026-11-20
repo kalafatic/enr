@@ -211,6 +211,88 @@ public final class EnrClient implements AutoCloseable {
         return devices;
     }
 
+    /** Generic JSON GET against the server (management surface). */
+    public JsonObject getJson(String path) {
+        return asObject(request("GET", path, null));
+    }
+
+    /** Generic JSON POST against the server (management surface). */
+    public JsonObject postJson(String path, JsonObject body) {
+        return asObject(request("POST", path, body == null ? new JsonObject() : body));
+    }
+
+    /** Generic JSON DELETE against the server (management surface). */
+    public JsonObject deleteJson(String path) {
+        return asObject(request("DELETE", path, null));
+    }
+
+    /**
+     * Ollama-style streaming chat: POST /api/chat with stream=true and consume
+     * newline-delimited JSON.
+     */
+    public void chatStream(String model, List<JsonObject> messages, Integer maxTokens,
+                           Float temperature, Consumer<String> onToken, Consumer<JsonObject> onDone) {
+        JsonObject req = new JsonObject();
+        req.put("model", model);
+        ai.enr.core.json.JsonArray arr = new ai.enr.core.json.JsonArray();
+        for (JsonObject message : messages) {
+            arr.add(message);
+        }
+        req.put("messages", arr);
+        req.put("stream", true);
+        if (maxTokens != null) {
+            JsonObject options = new JsonObject();
+            options.put("num_predict", maxTokens);
+            req.put("options", options);
+        }
+        HttpRequest httpRequest = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/api/chat"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/x-ndjson")
+                .POST(HttpRequest.BodyPublishers.ofString(Json.write(req, false)))
+                .build();
+        try {
+            HttpResponse<java.io.InputStream> response = http.send(httpRequest,
+                    HttpResponse.BodyHandlers.ofInputStream());
+            if (response.statusCode() != 200) {
+                throw new EnrException(response.statusCode(), "HTTP_ERROR",
+                        "Chat request failed: " + response.statusCode());
+            }
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(response.body(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isBlank()) {
+                        continue;
+                    }
+                    JsonValue parsed = Json.parse(line);
+                    if (!(parsed instanceof JsonObject obj)) {
+                        continue;
+                    }
+                    if (obj.has("error")) {
+                        onDone.accept(obj);
+                        return;
+                    }
+                    JsonObject message = obj.getObject("message");
+                    String piece = message == null ? "" : message.getString("content", "");
+                    boolean done = obj.getBoolean("done", false);
+                    if (done) {
+                        onDone.accept(obj);
+                        return;
+                    }
+                    if (!piece.isEmpty()) {
+                        onToken.accept(piece);
+                    }
+                }
+            }
+        } catch (java.io.IOException e) {
+            throw new EnrException(-1, "IO_ERROR", e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new EnrException(-1, "INTERRUPTED", "Chat stream interrupted");
+        }
+    }
+
     public static final class InferenceRequest {
         private Integer maxTokens;
         private Float temperature;

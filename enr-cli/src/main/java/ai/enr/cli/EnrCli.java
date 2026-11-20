@@ -4,8 +4,10 @@ import ai.enr.client.EnrClient;
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
-import ai.enr.runtime.EnrRuntime;
-import ai.enr.runtime.RuntimeConfig;
+import ai.enr.manager.EnrConfig;
+import ai.enr.manager.EnrConfigLoader;
+import ai.enr.manager.EnrManager;
+import ai.enr.manager.service.SystemdSupport;
 import ai.enr.server.EnrServer;
 
 import java.io.IOException;
@@ -24,15 +26,18 @@ import java.util.logging.Logger;
  * ENR command line interface.
  *
  * Commands:
- *   enr start [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]
+ *   enr serve [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]   foreground server (systemd)
+ *   enr start [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]   server with pid file
  *   enr stop
- *   enr status
- *   enr models
- *   enr load <path> [--backend cpu|cuda]
- *   enr unload <modelId> [--force]
- *   enr infer <modelId> "<prompt>" [--max-tokens N] [--temperature F] [--stream] [--session S]
- *   enr devices
- *   enr diagnostics
+ *   enr status | models | devices | diagnostics
+ *   enr list                              installed models
+ *   enr pull <ref> [--no-stream]          download from Ollama Library / Hugging Face
+ *   enr remove <id>
+ *   enr import <path> [--id id]
+ *   enr load <path> | unload <id> | infer <model> "<prompt>"
+ *   enr chat <model> ["prompt"] [--max-tokens N] [--temperature F] [--multi]
+ *   enr provider add|list|remove|test|models <...>
+ *   enr service install|uninstall|status|unit [--config PATH] [--jar PATH] [--user U]
  */
 public final class EnrCli {
 
@@ -53,7 +58,8 @@ public final class EnrCli {
         String[] rest = java.util.Arrays.copyOfRange(args, 1, args.length);
         try {
             return switch (command) {
-                case "start" -> start(rest);
+                case "serve" -> serve(rest, false);
+                case "start" -> serve(rest, true);
                 case "stop" -> stop(rest);
                 case "status" -> client(rest).map(c -> {
                     System.out.println(Json.write(c.status(), true));
@@ -71,11 +77,18 @@ public final class EnrCli {
                     }
                     return 0;
                 }).orElse(1);
+                case "list" -> list(rest);
+                case "pull" -> pull(rest);
+                case "remove" -> remove(rest);
+                case "import" -> importModel(rest);
                 case "load" -> load(rest);
                 case "unload" -> unload(rest);
                 case "infer" -> infer(rest);
+                case "chat" -> chat(rest);
                 case "devices" -> devices(rest);
                 case "diagnostics" -> diagnostics(rest);
+                case "provider", "providers" -> providers(rest);
+                case "service" -> service(rest);
                 case "help", "--help", "-h" -> {
                     printUsage();
                     yield 0;
@@ -92,7 +105,9 @@ public final class EnrCli {
         }
     }
 
-    private int start(String[] args) throws Exception {
+    // ------------------------------------------------------------ server
+
+    private int serve(String[] args, boolean writePidFile) throws Exception {
         String host = null;
         int port = -1;
         Path configPath = null;
@@ -104,71 +119,90 @@ public final class EnrCli {
                 case "-c", "--config" -> configPath = Path.of(args[++i]);
                 case "--cuda" -> backend = "cuda";
                 case "--cpu" -> backend = "cpu";
-                default -> throw new IllegalArgumentException("Unknown start option: " + args[i]);
+                default -> throw new IllegalArgumentException("Unknown serve option: " + args[i]);
             }
         }
-        JsonObject config = CliConfig.load(configPath);
-        RuntimeConfig.Builder builder = RuntimeConfig.builder();
-        JsonObject server = config.getObject("server");
-        if (server != null) {
-            if (host == null) {
-                host = server.getString("host");
-            }
-            if (port < 0) {
-                port = server.getInt("port", -1);
-            }
-        }
-        JsonObject runtime = config.getObject("runtime");
-        if (runtime != null) {
-            if (backend == null) {
-                backend = runtime.getString("preferred_backend");
-            }
-            builder.preferredBackend(backend != null ? backend : "cpu");
-            builder.modelDirectories(CliConfig.modelDirectories(config));
-            builder.maxConcurrentSessions(runtime.getInt("max_concurrent_sessions",
-                    builder.build().maxConcurrentSessions()));
-            builder.defaultMaxTokens(runtime.getInt("default_max_tokens", builder.build().defaultMaxTokens()));
-        }
-        RuntimeConfig runtimeConfig = builder.host(host != null ? host : "127.0.0.1")
-                .port(port > 0 ? port : 8111)
-                .build();
+        EnrConfig config = EnrConfigLoader.load(configPath);
+        config = rebase(config, host, port, backend);
 
-        EnrRuntime runtimeInstance = new EnrRuntime(runtimeConfig);
-        for (Path dir : runtimeConfig.modelDirectories()) {
-            for (Path modelFile : runtimeInstance.models().discoverModelFiles()) {
-                System.out.println("Auto-loading model: " + modelFile);
-                runtimeInstance.loadModel(modelFile);
-            }
-        }
-        EnrServer serverInstance = new EnrServer(runtimeInstance, runtimeConfig.host(), runtimeConfig.port());
-        serverInstance.start();
-        System.out.println("ENR started on " + runtimeConfig.host() + ":" + serverInstance.port());
+        EnrManager manager = new EnrManager(config);
+        autoLoad(manager);
+        EnrServer server = new EnrServer(manager, config.host(), config.port());
+        server.start();
+        System.out.println("ENR server started on " + config.host() + ":" + server.port());
+        System.out.println("  Web Control Center: http://" + displayHost(config.host()) + ":" + server.port() + "/");
+        System.out.println("  Ollama API:        http://" + displayHost(config.host()) + ":" + server.port() + "/api");
+        System.out.println("  OpenAI API:        http://" + displayHost(config.host()) + ":" + server.port() + "/v1");
 
         Path pidFile = Path.of("/tmp/enr.pid");
-        try {
-            Files.writeString(pidFile, String.valueOf(ProcessHandle.current().pid()));
-        } catch (IOException e) {
-            System.err.println("Warning: could not write pid file: " + e.getMessage());
+        if (writePidFile) {
+            try {
+                Files.writeString(pidFile, String.valueOf(ProcessHandle.current().pid()));
+            } catch (IOException e) {
+                System.err.println("Warning: could not write pid file: " + e.getMessage());
+            }
         }
 
         CountDownLatch latch = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down ENR...");
-            serverInstance.close();
-            runtimeInstance.shutdown();
-            try {
-                Files.deleteIfExists(pidFile);
-            } catch (IOException ignored) {
-                // best effort
+            System.out.println("Shutting down ENR (unloading models)...");
+            server.close();
+            manager.close();
+            if (writePidFile) {
+                try {
+                    Files.deleteIfExists(pidFile);
+                } catch (IOException ignored) {
+                    // best effort
+                }
             }
             latch.countDown();
-        }));
+        }, "enr-shutdown"));
         try {
             latch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
         return 0;
+    }
+
+    private void autoLoad(EnrManager manager) {
+        for (Path dir : manager.config().modelDirectories()) {
+            try {
+                for (Path modelFile : manager.runtime().models().discoverModelFiles()) {
+                    System.out.println("Auto-loading model: " + modelFile);
+                    manager.runtime().loadModel(modelFile);
+                }
+            } catch (Exception e) {
+                System.err.println("Warning: auto-load failed for " + dir + ": " + e.getMessage());
+            }
+        }
+    }
+
+    private static String displayHost(String host) {
+        return "0.0.0.0".equals(host) || host == null ? "127.0.0.1" : host;
+    }
+
+    private static EnrConfig rebase(EnrConfig config, String host, int port, String backend) {
+        return EnrConfig.builder()
+                .host(host != null ? host : config.host())
+                .port(port > 0 ? port : config.port())
+                .dataDir(config.dataDir())
+                .modelsDir(config.modelsDir())
+                .logDir(config.logDir())
+                .modelDirectories(config.modelDirectories())
+                .preferredBackend(backend != null ? backend : config.preferredBackend())
+                .allowCudaFallback(config.allowCudaFallback())
+                .maxConcurrentSessions(config.maxConcurrentSessions())
+                .defaultMaxTokens(config.defaultMaxTokens())
+                .sessionIdleTimeoutSeconds(config.sessionIdleTimeoutSeconds())
+                .requestTimeoutSeconds(config.requestTimeoutSeconds())
+                .enableMetrics(config.enableMetrics())
+                .authToken(config.authToken())
+                .ollamaRegistryUrl(config.ollamaRegistryUrl())
+                .ollamaSearchUrl(config.ollamaSearchUrl())
+                .huggingFaceApiUrl(config.huggingFaceApiUrl())
+                .downloadTimeoutMs(config.downloadTimeoutMs())
+                .build();
     }
 
     private int stop(String[] args) throws IOException, InterruptedException {
@@ -184,6 +218,441 @@ public final class EnrCli {
         System.err.println("No ENR pid file found; ENR may not be running or was started without pid tracking.");
         return 1;
     }
+
+    // ------------------------------------------------------------ model management
+
+    private int list(String[] args) {
+        var client = client(args).orElseThrow();
+        JsonObject body = client.getJson("/api/v1/catalog/models");
+        JsonArray models = body.getArray("models");
+        if (models == null || models.size() == 0) {
+            System.out.println("No models installed.");
+            return 0;
+        }
+        System.out.printf("%-24s %-10s %-10s %-8s %-9s %s%n", "NAME", "STATE", "BACKEND", "SIZE", "VERIFIED", "SOURCE");
+        for (int i = 0; i < models.size(); i++) {
+            JsonObject m = models.getObject(i);
+            String state = m.getBoolean("loaded", false) ? "loaded" : "stopped";
+            String backend = m.getString("backend", "");
+            long size = m.getLong("size_bytes", -1);
+            System.out.printf("%-24s %-10s %-10s %-8s %-9s %s%n",
+                    m.getString("id", ""), state,
+                    backend.isBlank() ? "-" : backend,
+                    size >= 0 ? humanBytes(size) : "-",
+                    m.getBoolean("verified", false) ? "yes" : "no",
+                    m.getString("source", "-"));
+        }
+        return 0;
+    }
+
+    private int pull(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr pull <ref> [--no-stream]   (ref: NAME[:TAG] or hf:REPO/FILE.gguf)");
+            return 1;
+        }
+        String ref = args[0];
+        boolean stream = !java.util.Arrays.asList(args).contains("--no-stream");
+        var client = client(args).orElseThrow();
+        if (stream) {
+            try {
+                var done = streamPull(client, ref);
+                if (done.has("error")) {
+                    System.err.println("Pull failed: " + done.getString("error", "unknown error"));
+                    return 1;
+                }
+                System.out.println("Pull complete: " + ref);
+                return 0;
+            } catch (Exception e) {
+                System.err.println("Pull failed: " + e.getMessage());
+                return 1;
+            }
+        }
+        JsonObject body = new JsonObject();
+        body.put("name", ref);
+        JsonObject response = client.postJson("/api/v1/catalog/pull", body);
+        String downloadId = response.getString("download_id", "");
+        while (true) {
+            JsonObject downloads = client.getJson("/api/v1/downloads");
+            JsonArray arr = downloads.getArray("downloads");
+            JsonObject job = null;
+            if (arr != null) {
+                for (int i = 0; i < arr.size(); i++) {
+                    JsonObject entry = arr.getObject(i);
+                    if (downloadId.equals(entry.getString("id", ""))) {
+                        job = entry;
+                    }
+                }
+            }
+            if (job == null) {
+                System.err.println("Download job vanished.");
+                return 1;
+            }
+            String status = job.getString("status", "");
+            if ("completed".equals(status)) {
+                System.out.println("Pull complete: " + ref);
+                return 0;
+            }
+            if ("failed".equals(status) || "cancelled".equals(status)) {
+                System.err.println("Pull " + status + ": " + job.getString("error", ""));
+                return 1;
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return 1;
+            }
+        }
+    }
+
+    private JsonObject streamPull(EnrClient client, String ref) throws Exception {
+        JsonObject request = new JsonObject();
+        request.put("name", ref);
+        request.put("stream", true);
+        java.net.http.HttpRequest httpRequest = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(client.baseUrl() + "/api/pull"))
+                .header("Content-Type", "application/json")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(Json.write(request, false)))
+                .build();
+        java.net.http.HttpResponse<java.io.InputStream> response = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(30))
+                .build()
+                .send(httpRequest, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+        if (response.statusCode() != 200) {
+            throw new IOException("HTTP " + response.statusCode());
+        }
+        JsonObject last = new JsonObject();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(response.body()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                JsonObject event = Json.parseObject(line);
+                last = event;
+                String status = event.getString("status", "");
+                long total = event.getLong("total", 0);
+                long completed = event.getLong("completed", 0);
+                String message = status.isBlank() ? event.getString("error", "") : status;
+                if (total > 0 && completed >= 0) {
+                    System.out.printf("\r%s %s/%s (%d%%)", message, humanBytes(completed),
+                            humanBytes(total), completed * 100 / total);
+                } else {
+                    System.out.println(message);
+                }
+                if (event.has("error")) {
+                    return event;
+                }
+            }
+        }
+        System.out.println();
+        return last;
+    }
+
+    private int remove(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr remove <modelId>");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        client.deleteJson("/api/v1/catalog/models/" + java.net.URLEncoder.encode(args[0]));
+        System.out.println("Removed model: " + args[0]);
+        return 0;
+    }
+
+    private int importModel(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr import <path> [--id modelId]");
+            return 1;
+        }
+        String path = args[0];
+        String id = null;
+        for (int i = 1; i < args.length; i++) {
+            if ("--id".equals(args[i])) {
+                id = args[++i];
+            }
+        }
+        var client = client(args).orElseThrow();
+        JsonObject body = new JsonObject();
+        body.put("path", path);
+        if (id != null) {
+            body.put("id", id);
+        }
+        JsonObject response = client.postJson("/api/v1/catalog/import", body);
+        JsonObject model = response.getObject("model");
+        System.out.println("Imported model: " + (model == null ? path : model.getString("id", path)));
+        return 0;
+    }
+
+    private int chat(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr chat <model> [\"prompt\"] [--max-tokens N] [--temperature F] [--multi]");
+            return 1;
+        }
+        String model = args[0];
+        Integer maxTokens = null;
+        Float temperature = null;
+        boolean multi = false;
+        String initialPrompt = null;
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--max-tokens" -> maxTokens = Integer.parseInt(args[++i]);
+                case "--temperature" -> temperature = Float.parseFloat(args[++i]);
+                case "--multi" -> multi = true;
+                default -> initialPrompt = args[i];
+            }
+        }
+        var client = client(args).orElseThrow();
+        List<JsonObject> messages = new ArrayList<>();
+        if (initialPrompt != null) {
+            messages.add(chatMessage("user", initialPrompt));
+        }
+        System.out.println("Chat with " + model + " (Ctrl+D or /exit to quit)");
+        try (java.io.BufferedReader console = new java.io.BufferedReader(
+                new java.io.InputStreamReader(System.in))) {
+            while (true) {
+                String prompt = initialPrompt;
+                initialPrompt = null;
+                if (prompt == null) {
+                    System.out.print("> ");
+                    prompt = console.readLine();
+                    if (prompt == null || "/exit".equals(prompt.strip())) {
+                        System.out.println("Bye.");
+                        return 0;
+                    }
+                    if (prompt.isBlank()) {
+                        continue;
+                    }
+                }
+                messages.add(chatMessage("user", prompt));
+                final boolean lastTurn = !multi;
+                client.chatStream(model, messages, maxTokens, temperature,
+                        token -> System.out.print(token),
+                        done -> {
+                            JsonObject message = done.getObject("message");
+                            if (done.has("error")) {
+                                System.out.println("\n[error: " + done.getString("error", "") + "]");
+                            } else {
+                                System.out.println();
+                            }
+                            messages.add(chatMessage("assistant",
+                                    message == null ? "" : message.getString("content", "")));
+                        });
+                if (lastTurn) {
+                    break;
+                }
+            }
+            return 0;
+        } catch (IOException e) {
+            System.err.println("Chat failed: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private static JsonObject chatMessage(String role, String content) {
+        JsonObject message = new JsonObject();
+        message.put("role", role);
+        message.put("content", content);
+        return message;
+    }
+
+    // ------------------------------------------------------------ providers
+
+    private int providers(String[] args) {
+        if (args.length == 0) {
+            System.err.println("Usage: enr provider list|add|remove|test|models <...>");
+            return 1;
+        }
+        return switch (args[0]) {
+            case "list" -> providerList(java.util.Arrays.copyOfRange(args, 1, args.length));
+            case "add" -> providerAdd(java.util.Arrays.copyOfRange(args, 1, args.length));
+            case "remove" -> providerRemove(java.util.Arrays.copyOfRange(args, 1, args.length));
+            case "test" -> providerTest(java.util.Arrays.copyOfRange(args, 1, args.length));
+            case "models" -> providerModels(java.util.Arrays.copyOfRange(args, 1, args.length));
+            default -> {
+                System.err.println("Unknown provider subcommand: " + args[0]);
+                yield 1;
+            }
+        };
+    }
+
+    private int providerList(String[] args) {
+        var client = client(args).orElseThrow();
+        JsonObject body = client.getJson("/api/v1/providers");
+        JsonArray arr = body.getArray("providers");
+        if (arr == null || arr.size() == 0) {
+            System.out.println("No providers configured.");
+            return 0;
+        }
+        System.out.printf("%-16s %-18s %-8s %-10s %s%n", "ID", "TYPE", "ENABLED", "STATUS", "BASE URL");
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject p = arr.getObject(i);
+            String status = p.getBoolean("last_test_ok", false) ? "ok" : "untested";
+            System.out.printf("%-16s %-18s %-8s %-10s %s%n",
+                    p.getString("id", ""), p.getString("type", ""),
+                    p.getBoolean("enabled", true) ? "yes" : "no",
+                    status, p.getString("base_url", ""));
+        }
+        return 0;
+    }
+
+    private int providerAdd(String[] args) {
+        String id = null, type = null, name = null, baseUrl = null, apiKey = "";
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--id" -> id = args[++i];
+                case "--type" -> type = args[++i];
+                case "--name" -> name = args[++i];
+                case "--base-url" -> baseUrl = args[++i];
+                case "--api-key" -> apiKey = args[++i];
+                default -> throw new IllegalArgumentException("Unknown provider add option: " + args[i]);
+            }
+        }
+        if (type == null) {
+            System.err.println("Usage: enr provider add --type deepseek|openai|anthropic|gemini|"
+                    + "openai-compatible|ollama|llama.cpp --api-key KEY [--id ID] [--name N] [--base-url URL]");
+            return 1;
+        }
+        var client = client(new String[0]).orElseThrow();
+        JsonObject body = new JsonObject();
+        body.put("id", id == null ? type : id);
+        body.put("type", type);
+        body.put("name", name == null ? type : name);
+        if (baseUrl != null) {
+            body.put("base_url", baseUrl);
+        }
+        body.put("api_key", apiKey);
+        JsonObject provider = client.postJson("/api/v1/providers", body);
+        System.out.println("Provider added: " + provider.getString("id", "")
+                + " (" + provider.getString("type", "") + ")");
+        return 0;
+    }
+
+    private int providerRemove(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr provider remove <id>");
+            return 1;
+        }
+        var client = client(new String[0]).orElseThrow();
+        client.deleteJson("/api/v1/providers/" + java.net.URLEncoder.encode(args[0]));
+        System.out.println("Provider removed: " + args[0]);
+        return 0;
+    }
+
+    private int providerTest(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr provider test <id>");
+            return 1;
+        }
+        var client = client(new String[0]).orElseThrow();
+        JsonObject result = client.postJson("/api/v1/providers/"
+                + java.net.URLEncoder.encode(args[0]) + "/test", new JsonObject());
+        System.out.println(result.getBoolean("ok", false)
+                ? "OK: " + result.getString("message", "") + " (" + result.getLong("elapsed_ms", 0) + " ms)"
+                : "FAILED: " + result.getString("message", ""));
+        JsonArray models = result.getArray("models");
+        if (models != null && models.size() > 0) {
+            System.out.println("Models (" + models.size() + "):");
+            for (int i = 0; i < models.size(); i++) {
+                System.out.println("  " + models.getString(i));
+            }
+        }
+        return result.getBoolean("ok", false) ? 0 : 1;
+    }
+
+    private int providerModels(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr provider models <id>");
+            return 1;
+        }
+        var client = client(new String[0]).orElseThrow();
+        JsonObject result = client.getJson("/api/v1/providers/"
+                + java.net.URLEncoder.encode(args[0]) + "/models");
+        JsonArray models = result.getArray("models");
+        if (models == null || models.size() == 0) {
+            System.out.println("No models reported.");
+            return 0;
+        }
+        for (int i = 0; i < models.size(); i++) {
+            System.out.println(models.getString(i));
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------ system service
+
+    private int service(String[] args) throws IOException {
+        if (args.length == 0) {
+            System.err.println("Usage: enr service install|uninstall|status|unit [--config PATH] [--jar PATH] [--user U] [--group G]");
+            return 1;
+        }
+        Path configPath = Path.of("/etc/enr/enr.yaml");
+        Path jarPath = SystemdSupport.defaultJarPath();
+        String user = System.getProperty("user.name", "root");
+        String group = user;
+        boolean userExplicit = false;
+        String logDir = "/var/log/enr";
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--config" -> configPath = Path.of(args[++i]);
+                case "--jar" -> jarPath = Path.of(args[++i]);
+                case "--user" -> {
+                    user = args[++i];
+                    userExplicit = true;
+                }
+                case "--group" -> group = args[++i];
+                case "--log-dir" -> logDir = args[++i];
+                default -> throw new IllegalArgumentException("Unknown service option: " + args[i]);
+            }
+        }
+        if (userExplicit && java.util.Arrays.stream(args).noneMatch("--group"::equals)) {
+            group = user;
+        }
+        return switch (args[0]) {
+            case "unit" -> {
+                Path java = SystemdSupport.currentJavaBinary();
+                System.out.println(SystemdSupport.unitFile(java.toString(), jarPath.toString(),
+                        configPath.toString(), user, group, logDir));
+                yield 0;
+            }
+            case "install" -> {
+                if (!Files.exists(jarPath)) {
+                    System.err.println("JAR not found: " + jarPath + " (run mvn package first, or pass --jar)");
+                    yield 1;
+                }
+                for (String problem : SystemdSupport.checkEnvironment()) {
+                    System.err.println("WARNING: " + problem);
+                }
+                Path modelsDir = Path.of("/var/lib/enr/models");
+                SystemdSupport.ensureSystemConfig(configPath, modelsDir, Path.of(logDir));
+                SystemdSupport.install(SystemdSupport.currentJavaBinary(), jarPath, configPath,
+                        user, group, Path.of(logDir));
+                System.out.println("Installed " + SystemdSupport.UNIT_NAME);
+                System.out.println("  config:   " + configPath);
+                System.out.println("  models:   " + modelsDir);
+                System.out.println("  logs:     " + logDir);
+                System.out.println("Run 'systemctl start enr' to start the service, "
+                        + "'systemctl enable enr' already ran.");
+                yield 0;
+            }
+            case "uninstall" -> {
+                SystemdSupport.uninstall();
+                System.out.println("Removed " + SystemdSupport.UNIT_NAME);
+                yield 0;
+            }
+            case "status" -> {
+                System.out.println(SystemdSupport.status());
+                yield 0;
+            }
+            default -> {
+                System.err.println("Unknown service subcommand: " + args[0]);
+                yield 1;
+            }
+        };
+    }
+
+    // ------------------------------------------------------------ legacy commands
 
     private int load(String[] args) {
         if (args.length < 1) {
@@ -300,20 +769,54 @@ public final class EnrCli {
         return java.util.Optional.of(new EnrClient(base));
     }
 
+    private static String humanBytes(long bytes) {
+        if (bytes < 1024) {
+            return bytes + " B";
+        }
+        double value = bytes;
+        String[] units = {"KB", "MB", "GB", "TB"};
+        int unit = -1;
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024;
+            unit++;
+        }
+        return String.format(java.util.Locale.ROOT, "%.1f %s", value, units[unit]);
+    }
+
     private static void printUsage() {
         System.out.println("""
-                EVO Native Runtime (ENR) CLI
+                ENR — Native AI Model Inference Runtime & Control Center
 
-                Usage:
-                  enr start [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]
+                Server:
+                  enr serve [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]    foreground server
+                  enr start [same options]                                          server with pid file
                   enr stop
-                  enr status [--url http://host:port]
-                  enr models
+                  enr status | devices | diagnostics
+
+                Models:
+                  enr list                                             installed models
+                  enr pull <NAME[:TAG] | hf:REPO/FILE.gguf> [--no-stream]
+                  enr remove <modelId>
+                  enr import <path.gguf> [--id modelId]
                   enr load <path> [--backend cpu|cuda]
                   enr unload <modelId> [--force]
-                  enr infer <modelId> "<prompt>" [--max-tokens N] [--temperature F] [--stream] [--session S]
-                  enr devices
-                  enr diagnostics
+                  enr infer <modelId> "<prompt>" [--max-tokens N] [--temperature F] [--stream]
+
+                Chat:
+                  enr chat <model> ["prompt"] [--max-tokens N] [--temperature F] [--multi]
+
+                Providers:
+                  enr provider list
+                  enr provider add --type deepseek|openai|anthropic|gemini|openai-compatible|ollama|llama.cpp --api-key KEY [--id ID] [--base-url URL]
+                  enr provider remove <id>
+                  enr provider test <id>
+                  enr provider models <id>
+
+                System service:
+                  enr service unit [--config PATH] [--jar PATH] [--user U]
+                  enr service install [--config PATH] [--jar PATH] [--user U]
+                  enr service uninstall
+                  enr service status
                 """);
     }
 

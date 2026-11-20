@@ -1,9 +1,25 @@
-runtime:
-  preferred_backend: cpu
-  model_directories:
-    - /home/petr/git/evo-native-runtime-161126/enr-model-loader/src/test/resources/models
-  max_concurrent_sessions: 8
-  default_max_tokens: 32
 server:
   host: 127.0.0.1
   port: 8111
+  # auth_token: ""            # optional Bearer token protecting the admin API + Web UI
+
+runtime:
+  preferred_backend: cpu      # cpu | cuda (cuda falls back to cpu unless allow_cuda_fallback: false)
+  allow_cuda_fallback: true
+  model_directories:
+    - /home/petr/git/evo-native-runtime-161126/enr-model-loader/src/test/resources/models
+  max_concurrent_sessions: 8
+  default_max_tokens: 256
+  session_idle_timeout_seconds: 1800
+  request_timeout_seconds: 300
+  enable_metrics: true
+
+storage:
+  data_dir: ~/.enr            # provider state (0600), registry
+  models_dir: ~/.enr/models   # installed models (one directory per model)
+  log_dir: ~/.enr/logs
+
+catalogs:
+  ollama_registry: https://registry.ollama.ai
+  ollama_search: https://ollama.com
+  huggingface_api: https://huggingface.co

@@ -48,11 +48,26 @@ public final class EnrRuntime {
             InferenceSession session) {
     }
 
+    public record ActiveStreamInfo(String requestId, String modelId, long startedAt, int maxTokens) {
+    }
+
+    private static final class ActiveStream {
+        private final String modelId;
+        private final long startedAt;
+        private final GenerationEngine.GenerationRequest request;
+
+        private ActiveStream(String modelId, long startedAt, GenerationEngine.GenerationRequest request) {
+            this.modelId = modelId;
+            this.startedAt = startedAt;
+            this.request = request;
+        }
+    }
+
     private final RuntimeConfig config;
     private final ModelManager modelManager;
     private final SessionManager sessionManager;
     private final Metrics metrics = new Metrics();
-    private final java.util.concurrent.ConcurrentHashMap<String, GenerationEngine.GenerationRequest> activeStreams =
+    private final java.util.concurrent.ConcurrentHashMap<String, ActiveStream> activeStreams =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ScheduledExecutorService housekeeper;
     private volatile boolean running = true;
@@ -193,7 +208,7 @@ public final class EnrRuntime {
         int maxTokens = options.maxTokens() > 0 ? options.maxTokens() : config.defaultMaxTokens();
         var request = new GenerationEngine.GenerationRequest(promptIds, maxTokens,
                 options.sampling(), options.stopTokenIds());
-        activeStreams.put(requestId, request);
+        activeStreams.put(requestId, new ActiveStream(modelId, System.currentTimeMillis(), request));
         var timeoutTask = armTimeout(session, options.timeoutSeconds());
 
         CompletableFuture<TextResult> future = CompletableFuture.supplyAsync(() -> {
@@ -219,8 +234,8 @@ public final class EnrRuntime {
     }
 
     public void cancelStream(String requestId, String sessionId) {
-        GenerationEngine.GenerationRequest request = activeStreams.get(requestId);
-        if (request != null) {
+        ActiveStream active = activeStreams.get(requestId);
+        if (active != null) {
             InferenceSession session = sessionId != null ? sessionManager.find(sessionId).orElse(null) : null;
             if (session != null) {
                 session.cancel();
@@ -229,6 +244,15 @@ public final class EnrRuntime {
         if (sessionId != null) {
             sessionManager.find(sessionId).ifPresent(InferenceSession::cancel);
         }
+    }
+
+    /** Currently executing (streaming and blocking) inference requests. */
+    public List<ActiveStreamInfo> activeStreams() {
+        return activeStreams.entrySet().stream()
+                .map(e -> new ActiveStreamInfo(e.getKey(), e.getValue().modelId,
+                        e.getValue().startedAt, e.getValue().request.maxTokens()))
+                .sorted(java.util.Comparator.comparingLong(ActiveStreamInfo::startedAt))
+                .toList();
     }
 
     public List<DeviceInfo> devices() {
@@ -245,7 +269,7 @@ public final class EnrRuntime {
     public ai.enr.core.json.JsonObject status() {
         ai.enr.core.json.JsonObject obj = new ai.enr.core.json.JsonObject();
         obj.put("running", running);
-        obj.put("version", "1.0.0-SNAPSHOT");
+        obj.put("version", "2.6.11");
         obj.put("uptime_ms", metrics.uptimeMs());
         obj.put("models_loaded", modelManager.list().size());
         obj.put("sessions_active", sessionManager.liveCount());

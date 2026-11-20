@@ -105,8 +105,10 @@ public final class GgufReader {
                 } else if (info.ggmlType == GGML_TYPE_F16) {
                     dtype = DType.F16;
                 } else {
-                    throw new LoadException("Unsupported GGML tensor type " + info.ggmlType
-                            + " for tensor " + info.name + " (supported: F32, F16)");
+                    throw new LoadException("Tensor " + info.name + " uses GGML type " + info.ggmlType
+                            + " (quantized). The ENR native runtime currently supports F32 and F16 tensors "
+                            + "only; quantized models such as Q4_K_M cannot be executed natively yet. "
+                            + "Use an F16/F32 export (e.g. Darwin Forge) or a cloud provider for this model.");
                 }
                 long dataOffset = tensorDataSectionStart + info.offset;
                 if (dataOffset < 0 || dataOffset >= Files.size(path)) {
@@ -176,6 +178,14 @@ public final class GgufReader {
 
     private Architecture parseArchitecture(Map<String, Object> kv) throws LoadException {
         int vocabSize = (int) kvLong(kv, "llama.vocab_size", 0);
+        if (vocabSize <= 0) {
+            // Some real-world exports (e.g. Ollama library models) omit
+            // llama.vocab_size; the vocabulary length is authoritative.
+            Object tokens = kv.get("tokenizer.ggml.tokens");
+            if (tokens instanceof List<?> list) {
+                vocabSize = list.size();
+            }
+        }
         int dModel = (int) kvLong(kv, "llama.embedding_length", 0);
         int dff = (int) kvLong(kv, "llama.feed_forward_length", 0);
         int numBlocks = (int) kvLong(kv, "llama.block_count", 0);
@@ -211,7 +221,12 @@ public final class GgufReader {
 
     private TokenizerInfo parseTokenizer(Map<String, Object> kv) {
         TokenizerInfo tok = new TokenizerInfo().type("BPE");
-        tok.vocabSize((int) kvLong(kv, "llama.vocab_size", 0));
+        int vocabSize = (int) kvLong(kv, "llama.vocab_size", 0);
+        Object tokenListObj = kv.get("tokenizer.ggml.tokens");
+        if (vocabSize <= 0 && tokenListObj instanceof List<?> tokensList) {
+            vocabSize = tokensList.size();
+        }
+        tok.vocabSize(vocabSize);
         tok.bosTokenId((int) kvLong(kv, "tokenizer.ggml.bos_token_id", 1));
         tok.eosTokenId((int) kvLong(kv, "tokenizer.ggml.eos_token_id", 2));
         tok.unkTokenId((int) kvLong(kv, "tokenizer.ggml.unknown_token_id", 0));
