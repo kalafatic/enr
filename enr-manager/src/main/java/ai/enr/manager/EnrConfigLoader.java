@@ -61,6 +61,10 @@ public final class EnrConfigLoader {
             builder.huggingFaceApiUrl(catalogs.getString("huggingface_api", "https://huggingface.co"));
             builder.downloadTimeoutMs(catalogs.getLong("download_timeout_ms", 0));
         }
+        JsonObject modelProviders = config.getObject("model_providers");
+        if (modelProviders != null) {
+            builder.modelProviders(modelProviders);
+        }
         return builder.build();
     }
 

@@ -10,6 +10,7 @@ const state = {
   routable: [],
   chat: { messages: [], model: "", streaming: false },
   compare: { a: { messages: [], model: "" }, b: { messages: [], model: "" } },
+  modelManager: { provider: "ollama", pullModel: "", pulling: false, jobs: [] },
 };
 
 const $ = (sel, root) => (root || document).querySelector(sel);
@@ -124,6 +125,7 @@ async function render() {
     switch (state.page) {
       case "dashboard": await renderDashboard(main); break;
       case "models": await renderModels(main); break;
+      case "modelmanager": await renderModelManager(main); break;
       case "providers": await renderProviders(main); break;
       case "runtime": await renderRuntime(main); break;
       case "playground": await renderPlayground(main); break;
@@ -290,8 +292,168 @@ async function renderModels(main) {
   main.append(card);
 }
 
-async function renderDownloads(card) {
+// Model Manager: provider pull/list/remove + shared download jobs (scenario C).
+async function renderModelManager(main) {
+  main.append(el("h1", { text: "Model Manager" }),
+    el("p", { class: "sub", text: "Pull, list and remove models on registered providers" }));
+  const mm = state.modelManager;
+  mm.jobs = [];
+
+  const pullCard = el("div", { class: "card", style: "margin-bottom:16px" });
+  const providerSelect = el("select");
+  let providers = [];
+  try {
+    const data = await api("/api/v1/models/providers");
+    providers = (data.providers || []).filter(p => (p.capabilities || []).includes("MODEL_PULL"));
+  } catch (e) {
+    pullCard.append(el("div", { class: "empty", text: "Providers unavailable: " + e.message }));
+  }
+  for (const p of providers) {
+    providerSelect.append(el("option", { value: p.id, text: p.display_name + " (" + p.id + ")" }));
+  }
+  if (!mm.provider || !providers.some(p => p.id === mm.provider)) {
+    mm.provider = providers.length ? providers[0].id : "ollama";
+  }
+  providerSelect.value = mm.provider;
+  providerSelect.addEventListener("change", () => {
+    mm.provider = providerSelect.value;
+    refreshInstalled();
+  });
+
+  const modelInput = el("input", { placeholder: "Model identifier, e.g. qwen3-vl:30b", value: mm.pullModel || "" });
+  modelInput.addEventListener("input", () => { mm.pullModel = modelInput.value; });
+  const errorBox = el("div", { class: "sub", style: "color:var(--err);min-height:18px" });
+  const pullButton = el("button", { class: "btn primary", text: "Pull Model" });
+  pullButton.addEventListener("click", async () => {
+    const model = modelInput.value.trim();
+    if (!model) { errorBox.textContent = "Enter a model identifier"; return; }
+    if (mm.pulling) return;
+    mm.pulling = true;
+    pullButton.disabled = true;
+    errorBox.textContent = "";
+    try {
+      const job = await api("/api/v1/models/providers/" + encodeURIComponent(mm.provider) + "/pull",
+        { body: { model } });
+      mm.jobs.unshift(job.jobId || job.job_id);
+      toast("Pull started: " + model + " (" + (job.jobId || job.job_id) + ")");
+      refreshDownloads();
+    } catch (e) {
+      errorBox.textContent = e.message;
+    } finally {
+      mm.pulling = false;
+      pullButton.disabled = false;
+    }
+  });
+  pullCard.append(el("h3", { text: "Pull Model" }),
+    el("div", { class: "row" },
+      el("label", { text: "Provider", style: "flex:0 0 auto" }),
+      providerSelect,
+      el("label", { text: "Model", style: "flex:0 0 auto" }),
+      modelInput,
+      pullButton,
+      el("button", { class: "btn", text: "Refresh", onclick: () => refreshInstalled() }),
+    ),
+    errorBox);
+  main.append(pullCard);
+
+  const downloadsCard = el("div", { class: "card", id: "mm-downloads-card", style: "margin-bottom:16px" });
+  main.append(downloadsCard);
+  const refreshDownloads = () => renderModelDownloads(downloadsCard);
+  refreshDownloads();
+  state.timers.push(setInterval(refreshDownloads, 1000));
+
+  const installedCard = el("div", { class: "card", id: "mm-installed-card" });
+  main.append(installedCard);
+  const refreshInstalled = () => renderInstalled(installedCard);
+  refreshInstalled();
+}
+
+async function renderModelDownloads(card) {
+  try {
+    const data = await api("/api/v1/models/downloads");
+    const all = data.downloads || [];
+    const recent = all.slice(0, 8);
+    if (!recent.length) { card.classList.add("hidden"); return; }
+    card.classList.remove("hidden");
+    card.innerHTML = "";
+    card.append(el("h3", { text: "Downloads" }));
+    for (const d of recent) {
+      const row = el("div", { style: "margin-bottom:12px" });
+      const info = el("div", { class: "row" });
+      const pct = d.total_bytes > 0
+        ? Math.min(100, Math.round(d.completed_bytes * 100 / d.total_bytes)) : null;
+      const stateCls = d.status === "FAILED" ? "err" : d.status === "COMPLETED" ? "ok"
+        : d.status === "CANCELLED" || d.status === "CANCEL_REQUESTED" ? "muted" : "warn";
+      info.append(
+        el("span", { class: "mono", text: d.provider + " / " + d.model }),
+        badge(d.status, stateCls),
+        d.operation ? el("span", { class: "sub", text: d.operation }) : el("span"),
+        pct == null ? el("span", { class: "mono", text: fmtBytes(d.completed_bytes) })
+          : el("span", { class: "mono", text: pct + "% (" + fmtBytes(d.completed_bytes) + " / " + fmtBytes(d.total_bytes) + ")" }),
+      );
+      const bar = el("div", { class: "progress" },
+        el("div", { style: "width:" + (pct == null ? 0 : pct) + "%" }));
+      row.append(info, bar);
+      if (d.error) row.append(el("div", { class: "sub", style: "color:var(--err)", text: d.error }));
+      if (!["COMPLETED", "FAILED", "CANCELLED"].includes(d.status)) {
+        row.append(el("button", {
+          class: "btn small danger", text: "Cancel",
+          onclick: async () => {
+            try { await api("/api/v1/models/downloads/" + encodeURIComponent(d.job_id), { method: "DELETE" }); }
+            catch (e) { toast(e.message, "err"); }
+          },
+        }));
+      }
+      card.append(row);
+    }
+  } catch (e) {
+    card.innerHTML = "";
+    card.classList.remove("hidden");
+    card.append(el("h3", { text: "Downloads" }),
+      el("div", { class: "empty", text: "Download list unavailable: " + e.message }));
+  }
+}
+
+async function renderInstalled(card) {
   card.innerHTML = "";
+  const mm = state.modelManager;
+  card.append(el("h3", { text: "Installed Models — " + mm.provider }));
+  try {
+    const data = await api("/api/v1/models/providers/" + encodeURIComponent(mm.provider) + "/installed");
+    const models = data.models || [];
+    if (!models.length) {
+      card.append(el("div", { class: "empty", text: "No installed models on this provider." }));
+      return;
+    }
+    const table = el("table");
+    table.append(tr(["Model", "Size", "Digest", "Actions"], true));
+    for (const m of models) {
+      const row = tr([
+        el("span", { class: "mono", text: m.id }),
+        fmtBytes(m.size_bytes),
+        el("span", { class: "mono", text: (m.digest || "").slice(0, 16) + ((m.digest || "").length > 16 ? "…" : "") }),
+        el("button", {
+          class: "btn small danger", text: "Remove",
+          onclick: async () => {
+            if (!confirm("Remove " + m.id + " from " + mm.provider + "?")) return;
+            try {
+              await api("/api/v1/models/providers/" + encodeURIComponent(mm.provider) + "/"
+                + encodeURIComponent(m.id), { method: "DELETE" });
+              toast("Removed " + m.id);
+              renderInstalled(card);
+            } catch (e) { toast(e.message, "err"); }
+          },
+        }),
+      ]);
+      table.append(row);
+    }
+    card.append(table);
+  } catch (e) {
+    card.append(el("div", { class: "empty", text: "Installed models unavailable: " + e.message }));
+  }
+}
+
+async function renderDownloads(card) {  card.innerHTML = "";
   try {
     const data = await api("/api/v1/downloads");
     const active = (data.downloads || []).filter(d => d.status === "running");

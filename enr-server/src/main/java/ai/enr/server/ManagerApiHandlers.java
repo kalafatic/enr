@@ -419,6 +419,147 @@ final class ManagerApiHandlers {
         };
     }
 
+    // ------------------------------------------------------------ model management
+
+    /** GET /api/v1/models/providers: registered model providers with capabilities. */
+    static HttpHandler modelProviders(EnrManager manager) {
+        return exchange -> {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only GET allowed");
+                return;
+            }
+            HttpSupport.sendJson(exchange, 200, manager.modelManagement().providersToJson());
+        };
+    }
+
+    /**
+     * Routes /api/v1/models/providers/{provider}[/action]:
+     * GET available|installed, POST pull, DELETE {modelId}.
+     */
+    static HttpHandler modelProviderRoute(EnrManager manager) {
+        return exchange -> {
+            String rest = pathId(exchange, "/api/v1/models/providers/");
+            int slash = rest.indexOf('/');
+            String providerId = URLDecoder.decode(
+                    slash >= 0 ? rest.substring(0, slash) : rest, StandardCharsets.UTF_8);
+            String action = slash >= 0 ? rest.substring(slash + 1) : "";
+            var models = manager.modelManagement();
+            switch (exchange.getRequestMethod().toUpperCase()) {
+                case "GET" -> {
+                    switch (action) {
+                        case "available" -> {
+                            try {
+                                HttpSupport.sendJson(exchange, 200, models.modelsToJson(providerId));
+                            } catch (IllegalArgumentException e) {
+                                HttpSupport.sendError(exchange, 404, "PROVIDER_NOT_FOUND", e.getMessage());
+                            }
+                        }
+                        case "installed" -> {
+                            try {
+                                HttpSupport.sendJson(exchange, 200, models.installedToJson(providerId));
+                            } catch (IllegalArgumentException e) {
+                                HttpSupport.sendError(exchange, 404, "PROVIDER_NOT_FOUND", e.getMessage());
+                            }
+                        }
+                        default -> HttpSupport.sendError(exchange, 404, "NOT_FOUND",
+                                "Unknown model provider action: " + action);
+                    }
+                }
+                case "POST" -> {
+                    if (!"pull".equals(action)) {
+                        HttpSupport.sendError(exchange, 404, "NOT_FOUND",
+                                "Unknown model provider action: " + action);
+                        return;
+                    }
+                    if (!authorize(exchange, manager)) {
+                        return;
+                    }
+                    JsonObject request = HttpSupport.parseBodyObject(exchange);
+                    String model = request.getString("model", "");
+                    if (model.isBlank()) {
+                        HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'model' field");
+                        return;
+                    }
+                    try {
+                        HttpSupport.sendJson(exchange, 202, models.pullModel(providerId, model).toJson());
+                    } catch (IllegalArgumentException e) {
+                        HttpSupport.sendError(exchange, 404, "PROVIDER_NOT_FOUND", e.getMessage());
+                    } catch (IllegalStateException e) {
+                        HttpSupport.sendError(exchange, 409, "PULL_UNSUPPORTED", e.getMessage());
+                    }
+                }
+                case "DELETE" -> {
+                    if (!authorize(exchange, manager)) {
+                        return;
+                    }
+                    if (action.isBlank()) {
+                        HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing model identifier");
+                        return;
+                    }
+                    String modelId = URLDecoder.decode(action, StandardCharsets.UTF_8);
+                    try {
+                        models.removeModel(providerId, modelId);
+                        JsonObject response = new JsonObject();
+                        response.put("provider", providerId);
+                        response.put("model", modelId);
+                        response.put("removed", true);
+                        HttpSupport.sendJson(exchange, 200, response);
+                    } catch (IllegalArgumentException e) {
+                        HttpSupport.sendError(exchange,
+                                e.getMessage() != null && e.getMessage().contains("not installed")
+                                        ? 404 : 400,
+                                "REMOVE_FAILED", e.getMessage());
+                    } catch (IllegalStateException e) {
+                        HttpSupport.sendError(exchange, 409, "REMOVE_UNSUPPORTED", e.getMessage());
+                    }
+                }
+                default -> HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "GET, POST or DELETE");
+            }
+        };
+    }
+
+    /** GET /api/v1/models/downloads: all model download jobs (newest first). */
+    static HttpHandler modelDownloads(EnrManager manager) {
+        return exchange -> {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only GET allowed");
+                return;
+            }
+            HttpSupport.sendJson(exchange, 200, manager.modelManagement().downloadsToJson());
+        };
+    }
+
+    /** Routes /api/v1/models/downloads/{jobId}: GET status, DELETE cancel. */
+    static HttpHandler modelDownloadRoute(EnrManager manager) {
+        return exchange -> {
+            String jobId = URLDecoder.decode(pathId(exchange, "/api/v1/models/downloads/"),
+                    StandardCharsets.UTF_8);
+            var models = manager.modelManagement();
+            switch (exchange.getRequestMethod().toUpperCase()) {
+                case "GET" -> {
+                    var status = models.getDownloadStatus(jobId);
+                    if (status.isEmpty()) {
+                        HttpSupport.sendError(exchange, 404, "DOWNLOAD_NOT_FOUND",
+                                "Unknown download job: " + jobId);
+                        return;
+                    }
+                    HttpSupport.sendJson(exchange, 200, status.get().toJson());
+                }
+                case "DELETE" -> {
+                    if (!authorize(exchange, manager)) {
+                        return;
+                    }
+                    boolean cancelled = models.cancelDownload(jobId);
+                    JsonObject response = new JsonObject();
+                    response.put("job_id", jobId);
+                    response.put("cancelled", cancelled);
+                    HttpSupport.sendJson(exchange, cancelled ? 200 : 404, response);
+                }
+                default -> HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "GET or DELETE");
+            }
+        };
+    }
+
     // ------------------------------------------------------------ shared
 
     private static boolean authorize(HttpExchange exchange, EnrManager manager) throws IOException {

@@ -7,6 +7,9 @@ import ai.enr.inference.GenerationEngine;
 import ai.enr.manager.catalog.Catalogs;
 import ai.enr.manager.download.DownloadManager;
 import ai.enr.manager.logs.LogBuffer;
+import ai.enr.manager.models.DownloadState;
+import ai.enr.manager.models.DownloadStatus;
+import ai.enr.manager.models.ModelManagementService;
 import ai.enr.manager.monitor.HardwareMonitor;
 import ai.enr.manager.provider.ChatMessage;
 import ai.enr.manager.provider.Provider;
@@ -56,6 +59,7 @@ public final class EnrManager implements AutoCloseable {
     private final ProviderClient providerClient = new ProviderClient();
     private final Catalogs catalogs;
     private final ModelRouter router;
+    private final ModelManagementService modelManagement;
     private final HardwareMonitor hardware = new HardwareMonitor();
     private final long startedAt = System.currentTimeMillis();
     private final AtomicReference<FileHandler> logFileHandler = new AtomicReference<>();
@@ -101,6 +105,30 @@ public final class EnrManager implements AutoCloseable {
                 log.info("downloads", "Download finished: " + job.name() + " -> " + job.targetFile());
             }
         });
+        this.modelManagement = new ModelManagementService(
+                ModelManagementService.configsFromJson(config.modelProviders()),
+                config.dataDir().resolve("model-download-jobs.json"), log);
+        modelManagement.addListener(new ModelManagementService.Listener() {
+            private final java.util.Map<String, DownloadState> lastStates = new java.util.concurrent.ConcurrentHashMap<>();
+
+            @Override
+            public void onChanged(DownloadStatus status) {
+                DownloadState previous = lastStates.put(status.jobId(), status.state());
+                if (previous != status.state()) {
+                    log.info("models", "Model pull " + status.state().name().toLowerCase()
+                            + ": " + status.providerId() + "/" + status.modelId()
+                            + progress(status.totalBytes(), status.completedBytes()));
+                }
+            }
+
+            @Override
+            public void onTerminal(DownloadStatus status) {
+                lastStates.put(status.jobId(), status.state());
+                log.info("models", "Model pull finished (" + status.state().name().toLowerCase()
+                        + "): " + status.providerId() + "/" + status.modelId()
+                        + (status.error().isBlank() ? "" : " - " + status.error()));
+            }
+        });
         log.info("enr", "ENR Manager started (data dir " + config.dataDir() + ", models dir "
                 + config.modelsDir() + ")");
     }
@@ -111,6 +139,14 @@ public final class EnrManager implements AutoCloseable {
             return " (" + percent + "%, " + job.completedBytes() + "/" + job.totalBytes() + " bytes)";
         }
         return " (" + job.completedBytes() + " bytes)";
+    }
+
+    private static String progress(long totalBytes, long completedBytes) {
+        if (totalBytes > 0) {
+            long percent = completedBytes * 100 / totalBytes;
+            return " (" + percent + "%, " + completedBytes + "/" + totalBytes + " bytes)";
+        }
+        return " (" + completedBytes + " bytes)";
     }
 
     private void installLogHandlers() {
@@ -144,6 +180,10 @@ public final class EnrManager implements AutoCloseable {
 
     public DownloadManager downloads() {
         return downloads;
+    }
+
+    public ModelManagementService modelManagement() {
+        return modelManagement;
     }
 
     public ProviderRegistry providers() {
@@ -720,6 +760,7 @@ public final class EnrManager implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        modelManagement.close();
         downloads.close();
         providerClient.close();
         catalogs.close();

@@ -22,6 +22,8 @@ registry (`ProviderRegistry`), one download manager, one router and one diagnost
 | `monitor.HardwareMonitor` | CPU load, RAM, GPU utilization/VRAM/temperature (CUDA driver + nvidia-smi), genuine values only |
 | `logs.LogBuffer` | In-memory ring buffer (JUL handler) + file logging to `log_dir` |
 | `service.SystemdSupport` | Production systemd unit generation, install/uninstall, default system config |
+| `models.ModelManagementService` | Unified provider model management: provider registry (ServiceLoader), async pull jobs with duplicate prevention, cancellation, listeners and durable status (see `ENR-MODEL-MANAGEMENT.md`) |
+| `models.ollama.OllamaModelProvider` | First provider: Ollama native HTTP API (`/api/tags`, `/api/show`, `/api/pull` streaming, `/api/delete`, `/api/version`) |
 
 ## 2. Model Management (implemented)
 

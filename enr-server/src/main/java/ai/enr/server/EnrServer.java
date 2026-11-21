@@ -98,6 +98,10 @@ public final class EnrServer implements AutoCloseable {
         server.createContext("/api/v1/models/stop", ManagerApiHandlers.modelStop(manager));
         server.createContext("/api/v1/downloads", ManagerApiHandlers.downloads(manager));
         server.createContext("/api/v1/downloads/cancel", ManagerApiHandlers.downloadCancel(manager));
+        server.createContext("/api/v1/models/providers", ManagerApiHandlers.modelProviders(manager));
+        server.createContext("/api/v1/models/providers/", ManagerApiHandlers.modelProviderRoute(manager));
+        server.createContext("/api/v1/models/downloads", ManagerApiHandlers.modelDownloads(manager));
+        server.createContext("/api/v1/models/downloads/", ManagerApiHandlers.modelDownloadRoute(manager));
         server.createContext("/api/v1/providers", ManagerApiHandlers.providers(manager));
         server.createContext("/api/v1/providers/", ManagerApiHandlers.providerRoute(manager));
         server.createContext("/api/v1/chat", ManagerApiHandlers.chat(manager));

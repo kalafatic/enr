@@ -65,18 +65,7 @@ public final class EnrCli {
                     System.out.println(Json.write(c.status(), true));
                     return 0;
                 }).orElse(1);
-                case "models" -> client(rest).map(c -> {
-                    var models = c.models();
-                    if (models.isEmpty()) {
-                        System.out.println("No models loaded.");
-                    }
-                    for (var model : models) {
-                        System.out.printf("%-20s %-8s %-10s params=%-10d backend=%s sessions=%d%n",
-                                model.id(), model.state(), model.architecture(),
-                                model.parameters(), model.backend(), model.activeSessions());
-                    }
-                    return 0;
-                }).orElse(1);
+                case "models" -> modelsCommand(rest);
                 case "list" -> list(rest);
                 case "pull" -> pull(rest);
                 case "remove" -> remove(rest);
@@ -106,6 +95,170 @@ public final class EnrCli {
     }
 
     // ------------------------------------------------------------ server
+
+    /** enr models [providers|installed <p>|available <p>|pull <p> <m>|status <job>|cancel <job>|remove <p> <m>] */
+    private int modelsCommand(String[] args) {
+        String sub = args.length > 0 && !args[0].startsWith("-") ? args[0] : "";
+        switch (sub) {
+            case "providers" -> {
+                return modelProviderList(java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "installed" -> {
+                return modelProviderModels("installed", java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "available" -> {
+                return modelProviderModels("available", java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "pull" -> {
+                return modelPull(java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "status" -> {
+                return modelJobStatus(java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "cancel" -> {
+                return modelJobCancel(java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "remove" -> {
+                return modelProviderRemove(java.util.Arrays.copyOfRange(args, 1, args.length));
+            }
+            default -> {
+            }
+        }
+        return client(args).map(c -> {
+            var models = c.models();
+            if (models.isEmpty()) {
+                System.out.println("No models loaded.");
+            }
+            for (var model : models) {
+                System.out.printf("%-20s %-8s %-10s params=%-10d backend=%s sessions=%d%n",
+                        model.id(), model.state(), model.architecture(),
+                        model.parameters(), model.backend(), model.activeSessions());
+            }
+            return 0;
+        }).orElse(1);
+    }
+
+    private int modelProviderList(String[] args) {
+        var client = client(args).orElseThrow();
+        JsonObject body = client.modelProviders();
+        JsonArray arr = body.getArray("providers");
+        if (arr == null || arr.size() == 0) {
+            System.out.println("No model providers registered.");
+            return 0;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject provider = arr.getObject(i);
+            JsonArray capabilities = provider.getArray("capabilities");
+            List<String> caps = new ArrayList<>();
+            if (capabilities != null) {
+                for (int j = 0; j < capabilities.size(); j++) {
+                    caps.add(capabilities.getString(j));
+                }
+            }
+            System.out.printf("%-16s %-24s reachable=%s capabilities=%s%n",
+                    provider.getString("id", ""), provider.getString("display_name", ""),
+                    provider.getBoolean("reachable", false), String.join(",", caps));
+        }
+        return 0;
+    }
+
+    private int modelProviderModels(String kind, String[] args) {
+        if (args.length < 1 || args[0].startsWith("-")) {
+            System.err.println("Usage: enr models " + kind + " <provider> [--url URL]");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        JsonObject body = "installed".equals(kind)
+                ? client.modelInstalled(args[0]) : client.modelAvailable(args[0]);
+        JsonArray arr = body.getArray("models");
+        if (arr == null || arr.size() == 0) {
+            System.out.println("No models.");
+            return 0;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject model = arr.getObject(i);
+            System.out.printf("%-32s %-10s %s%n", model.getString("id", ""),
+                    model.getLong("size_bytes", -1) >= 0
+                            ? humanBytes(model.getLong("size_bytes", -1)) : "-",
+                    model.getString("digest", ""));
+        }
+        return 0;
+    }
+
+    private int modelPull(String[] args) {
+        if (args.length < 2 || args[0].startsWith("-") || args[1].startsWith("-")) {
+            System.err.println("Usage: enr models pull <provider> <model> [--url URL]");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        EnrClient.ModelJob job = client.pullModel(args[0], args[1]);
+        System.out.println("Pull accepted: provider=" + job.provider() + " model=" + job.model()
+                + " job=" + job.jobId() + " status=" + job.status());
+        while (true) {
+            JsonObject status = client.downloadStatus(job.jobId());
+            String state = status.getString("status", "");
+            long percent = status.getInt("percent", 0);
+            long total = status.getLong("total_bytes", -1);
+            long completed = status.getLong("completed_bytes", 0);
+            String operation = status.getString("operation", "");
+            System.out.printf("\r%-12s %s%s %3d%%", state,
+                    operation.isBlank() ? "" : "(" + operation + ") ",
+                    total > 0 ? humanBytes(completed) + "/" + humanBytes(total) : "", percent);
+            if ("COMPLETED".equals(state)) {
+                System.out.println();
+                System.out.println("Pull complete: " + args[1]);
+                return 0;
+            }
+            if ("FAILED".equals(state)) {
+                System.out.println();
+                System.err.println("Pull failed: " + status.getString("error", ""));
+                return 1;
+            }
+            if ("CANCELLED".equals(state) || "CANCEL_REQUESTED".equals(state)) {
+                System.out.println();
+                System.out.println("Pull cancelled: " + args[1]);
+                return 0;
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return 1;
+            }
+        }
+    }
+
+    private int modelJobStatus(String[] args) {
+        if (args.length < 1 || args[0].startsWith("-")) {
+            System.err.println("Usage: enr models status <jobId> [--url URL]");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        System.out.println(Json.write(client.downloadStatus(args[0]), true));
+        return 0;
+    }
+
+    private int modelJobCancel(String[] args) {
+        if (args.length < 1 || args[0].startsWith("-")) {
+            System.err.println("Usage: enr models cancel <jobId> [--url URL]");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        JsonObject response = client.cancelDownload(args[0]);
+        System.out.println("Cancelled: " + response.getBoolean("cancelled", false));
+        return response.getBoolean("cancelled", false) ? 0 : 1;
+    }
+
+    private int modelProviderRemove(String[] args) {
+        if (args.length < 2 || args[0].startsWith("-") || args[1].startsWith("-")) {
+            System.err.println("Usage: enr models remove <provider> <model> [--url URL]");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        client.removeModel(args[0], args[1]);
+        System.out.println("Removed model: " + args[1] + " (provider " + args[0] + ")");
+        return 0;
+    }
 
     private int serve(String[] args, boolean writePidFile) throws Exception {
         String host = null;

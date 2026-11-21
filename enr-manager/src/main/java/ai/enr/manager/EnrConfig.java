@@ -1,5 +1,7 @@
 package ai.enr.manager;
 
+import ai.enr.core.json.JsonObject;
+
 import java.nio.file.Path;
 import java.util.List;
 
@@ -26,7 +28,8 @@ public record EnrConfig(
         String ollamaRegistryUrl,
         String ollamaSearchUrl,
         String huggingFaceApiUrl,
-        long downloadTimeoutMs) {
+        long downloadTimeoutMs,
+        JsonObject modelProviders) {
 
     public static Builder builder() {
         return new Builder();
@@ -55,6 +58,7 @@ public record EnrConfig(
         private String ollamaSearchUrl = "https://ollama.com";
         private String huggingFaceApiUrl = "https://huggingface.co";
         private long downloadTimeoutMs = 0;
+        private JsonObject modelProviders = new JsonObject();
 
         public Builder host(String host) {
             this.host = host;
@@ -146,11 +150,17 @@ public record EnrConfig(
             return this;
         }
 
+        public Builder modelProviders(JsonObject modelProviders) {
+            this.modelProviders = modelProviders == null ? new JsonObject() : modelProviders;
+            return this;
+        }
+
         public EnrConfig build() {
             return new EnrConfig(host, port, dataDir, modelsDir, logDir, modelDirectories,
                     preferredBackend, allowCudaFallback, maxConcurrentSessions, defaultMaxTokens,
                     sessionIdleTimeoutSeconds, requestTimeoutSeconds, enableMetrics,
-                    authToken, ollamaRegistryUrl, ollamaSearchUrl, huggingFaceApiUrl, downloadTimeoutMs);
+                    authToken, ollamaRegistryUrl, ollamaSearchUrl, huggingFaceApiUrl,
+                    downloadTimeoutMs, modelProviders);
         }
     }
 }

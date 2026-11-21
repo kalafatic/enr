@@ -9,6 +9,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
 
@@ -142,6 +143,124 @@ final class MockServers {
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
         return server;
+    }
+
+    /**
+     * Configurable mock Ollama API server (/api/tags, /api/show, /api/pull
+     * NDJSON stream, /api/delete, /api/version) for model management tests.
+     */
+    static final class OllamaMock implements AutoCloseable {
+
+        final HttpServer server;
+        final List<String> installed = new java.util.ArrayList<>();
+        volatile List<String> pullScript;
+        volatile long lineDelayMs = 0;
+        volatile boolean failPullRequest = false;
+        volatile long pulledRequests = 0;
+
+        OllamaMock() throws IOException {
+            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
+            server.createContext("/", exchange -> {
+                String path = exchange.getRequestURI().getPath();
+                switch (path) {
+                    case "/api/version" -> send(exchange, 200, "{\"version\":\"0.6.0-mock\"}", "application/json");
+                    case "/api/tags" -> {
+                        StringBuilder models = new StringBuilder();
+                        synchronized (installed) {
+                            for (int i = 0; i < installed.size(); i++) {
+                                if (models.length() > 0) {
+                                    models.append(',');
+                                }
+                                models.append("{\"name\":\"").append(installed.get(i))
+                                        .append("\",\"model\":\"").append(installed.get(i))
+                                        .append("\",\"modified_at\":\"2026-11-21T10:00:00Z\",")
+                                        .append("\"size\":").append(1_000_000 + i * 10_000)
+                                        .append(",\"digest\":\"sha256:mock").append(i).append("\",")
+                                        .append("\"details\":{\"family\":\"llama\",\"parameter_size\":\"7B\",")
+                                        .append("\"quantization_level\":\"Q4_K_M\",\"format\":\"gguf\",")
+                                        .append("\"context_length\":8192}}");
+                            }
+                        }
+                        send(exchange, 200, "{\"models\":[" + models + "]}", "application/json");
+                    }
+                    case "/api/show" -> {
+                        String body = new String(exchange.getRequestBody().readAllBytes());
+                        String name = body.replaceAll(".*\"name\"\\s*:\\s*\"([^\"]*)\".*", "$1");
+                        send(exchange, 200, "{\"model\":\"" + name + "\",\"digest\":\"sha256:show\","
+                                + "\"size\":123456,\"modified_at\":1769486400,"
+                                + "\"model_info\":{\"general.architecture\":\"llama\","
+                                + "\"general.parameter_count\":\"7000000000\","
+                                + "\"general.context_length\":8192,\"general.file_type\":\"Q4_K_M\"}}",
+                                "application/json");
+                    }
+                    case "/api/pull" -> {
+                        pulledRequests++;
+                        if (failPullRequest) {
+                            send(exchange, 404, "{\"error\":\"pull model manifest: file does not exist\"}",
+                                    "application/json");
+                            break;
+                        }
+                        exchange.getResponseHeaders().set("Content-Type", "application/x-ndjson");
+                        exchange.sendResponseHeaders(200, 0);
+                        try (OutputStream out = exchange.getResponseBody()) {
+                            for (String line : pullScript == null ? List.<String>of() : pullScript) {
+                                out.write((line + "\n").getBytes());
+                                out.flush();
+                                if (lineDelayMs > 0) {
+                                    Thread.sleep(lineDelayMs);
+                                }
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    case "/api/delete" -> {
+                        String body = new String(exchange.getRequestBody().readAllBytes());
+                        String name = body.replaceAll(".*\"name\"\\s*:\\s*\"([^\"]*)\".*", "$1");
+                        synchronized (installed) {
+                            if (installed.remove(name)) {
+                                send(exchange, 200, "{}", "application/json");
+                            } else {
+                                send(exchange, 404, "{\"error\":\"model '" + name + "' not found\"}",
+                                        "application/json");
+                            }
+                        }
+                    }
+                    default -> send(exchange, 404, "{\"error\":\"not found\"}", "application/json");
+                }
+            });
+            server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+            server.start();
+        }
+
+        String baseUrl() {
+            return "http://127.0.0.1:" + server.getAddress().getPort();
+        }
+
+        /** Standard two-layer pull script ending in success. */
+        static List<String> standardPullScript(String model, String layerA, String layerB) {
+            List<String> lines = new ArrayList<>();
+            lines.add("{\"status\":\"pulling manifest\"}");
+            lines.add("{\"status\":\"pulling " + layerA.substring(0, 8) + "\",\"digest\":\""
+                    + layerA + "\",\"total\":400,\"completed\":0}");
+            lines.add("{\"status\":\"pulling " + layerA.substring(0, 8) + "\",\"digest\":\""
+                    + layerA + "\",\"total\":400,\"completed\":200}");
+            lines.add("{\"status\":\"pulling " + layerB.substring(0, 8) + "\",\"digest\":\""
+                    + layerB + "\",\"total\":600,\"completed\":100}");
+            lines.add("{\"status\":\"pulling " + layerB.substring(0, 8) + "\",\"digest\":\""
+                    + layerB + "\",\"total\":600,\"completed\":600}");
+            lines.add("{\"status\":\"pulling " + layerA.substring(0, 8) + "\",\"digest\":\""
+                    + layerA + "\",\"total\":400,\"completed\":400}");
+            lines.add("{\"status\":\"verifying sha256 digest\"}");
+            lines.add("{\"status\":\"writing manifest\"}");
+            lines.add("{\"status\":\"success\"}");
+            return lines;
+        }
+
+        @Override
+        public void close() {
+            server.stop(0);
+        }
     }
 
     private static void send(HttpExchange exchange, int status, String body, String contentType)

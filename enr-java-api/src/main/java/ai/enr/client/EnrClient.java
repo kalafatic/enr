@@ -226,6 +226,56 @@ public final class EnrClient implements AutoCloseable {
         return asObject(request("DELETE", path, null));
     }
 
+    // ------------------------------------------------------------ model management
+
+    /** Handle of a model pull accepted by the shared model management service. */
+    public record ModelJob(String jobId, String provider, String model, String status,
+                           long createdAt) {
+    }
+
+    /** GET /api/v1/models/providers: registered model providers with capabilities. */
+    public JsonObject modelProviders() {
+        return getJson("/api/v1/models/providers");
+    }
+
+    /** GET /api/v1/models/providers/{provider}/available. */
+    public JsonObject modelAvailable(String provider) {
+        return getJson("/api/v1/models/providers/" + encode(provider) + "/available");
+    }
+
+    /** GET /api/v1/models/providers/{provider}/installed. */
+    public JsonObject modelInstalled(String provider) {
+        return getJson("/api/v1/models/providers/" + encode(provider) + "/installed");
+    }
+
+    /** POST /api/v1/models/providers/{provider}/pull — returns the download job handle. */
+    public ModelJob pullModel(String provider, String model) {
+        JsonObject req = new JsonObject();
+        req.put("model", model);
+        JsonObject response = postJson("/api/v1/models/providers/" + encode(provider) + "/pull", req);
+        return new ModelJob(
+                response.getString("jobId", response.getString("job_id", "")),
+                response.getString("provider", provider),
+                response.getString("model", model),
+                response.getString("status", "QUEUED"),
+                response.getLong("created_at", 0));
+    }
+
+    /** GET /api/v1/models/downloads/{jobId}: download progress snapshot. */
+    public JsonObject downloadStatus(String jobId) {
+        return getJson("/api/v1/models/downloads/" + encode(jobId));
+    }
+
+    /** DELETE /api/v1/models/downloads/{jobId}: cancels an active download. */
+    public JsonObject cancelDownload(String jobId) {
+        return deleteJson("/api/v1/models/downloads/" + encode(jobId));
+    }
+
+    /** DELETE /api/v1/models/providers/{provider}/{modelId}: removes an installed model. */
+    public JsonObject removeModel(String provider, String model) {
+        return deleteJson("/api/v1/models/providers/" + encode(provider) + "/" + encode(model));
+    }
+
     /**
      * Ollama-style streaming chat: POST /api/chat with stream=true and consume
      * newline-delimited JSON.

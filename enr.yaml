@@ -23,3 +23,12 @@ catalogs:
   ollama_registry: https://registry.ollama.ai
   ollama_search: https://ollama.com
   huggingface_api: https://huggingface.co
+
+# Model management providers (model pull/list/remove). Flat keys:
+# <providerId>.<option>. The Ollama provider is enabled by default.
+model_providers:
+  ollama.endpoint: http://localhost:11434
+  ollama.connect_timeout_ms: 10000
+  ollama.read_timeout_ms: 60000
+  ollama.download_timeout_ms: 0      # 0 = no overall limit
+  ollama.enabled: true
