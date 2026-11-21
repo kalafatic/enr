@@ -123,6 +123,71 @@ final class MockServers {
         return server;
     }
 
+    /**
+     * An OpenAI-compatible provider that performs structured tool calls.
+     * Captures the last chat/completions request body into {@code lastBody}
+     * (for passthrough assertions). Non-streaming responses return
+     * {@code message.tool_calls}; streaming responses emit tool_call deltas
+     * followed by {@code finish_reason: "tool_calls"}.
+     */
+    static HttpServer toolCallingProvider(String apiKey,
+                                          java.util.concurrent.atomic.AtomicReference<String> lastBody)
+            throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String auth = exchange.getRequestHeaders().getFirst("Authorization");
+            String expected = "Bearer " + apiKey;
+            if (!expected.equals(auth)) {
+                send(exchange, 401, "{\"error\":{\"message\":\"invalid api key\"}}", "application/json");
+                return;
+            }
+            if ("/v1/chat/completions".equals(path)) {
+                String body = new String(exchange.getRequestBody().readAllBytes());
+                if (lastBody != null) {
+                    lastBody.set(body);
+                }
+                if (body.contains("\"stream\":true")) {
+                    exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+                    exchange.sendResponseHeaders(200, 0);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(("data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\","
+                                + "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},"
+                                + "\"finish_reason\":null}]}\n\n"
+                                + "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\","
+                                + "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,"
+                                + "\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+                                + "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\",\"}}]},"
+                                + "\"finish_reason\":null}]}\n\n"
+                                + "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\","
+                                + "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,"
+                                + "\"function\":{\"arguments\":\"\\\"mode\\\":\\\"sunny\\\"}\"}}]},"
+                                + "\"finish_reason\":null}]}\n\n"
+                                + "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\","
+                                + "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+                                + "data: [DONE]\n\n").getBytes());
+                    }
+                    return;
+                }
+                send(exchange, 200,
+                        "{\"id\":\"c\",\"object\":\"chat.completion\",\"created\":1,"
+                                + "\"model\":\"mock-model\","
+                                + "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\","
+                                + "\"tool_calls\":[{\"id\":\"call_abc\",\"type\":\"function\","
+                                + "\"function\":{\"name\":\"get_weather\","
+                                + "\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},"
+                                + "\"finish_reason\":\"tool_calls\"}],"
+                                + "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":4,\"total_tokens\":9}}",
+                        "application/json");
+                return;
+            }
+            send(exchange, 404, "{\"error\":{\"message\":\"not found\"}}", "application/json");
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+        return server;
+    }
+
     /** Simple HTTP endpoint streaming bytes with a delay (download tests). */
     static HttpServer slowFileServer(byte[] payload, long chunkDelayMs) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);

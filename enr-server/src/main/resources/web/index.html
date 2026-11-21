@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -13,7 +13,7 @@
     <span class="subtitle">Control Center</span>
   </div>
   <nav id="nav">
-    <a href="#dashboard" data-page="dashboard">Dashboard</a>
+    <a href="#dashboard" data-page="dashboard" class="active">Dashboard</a>
     <a href="#models" data-page="models">Models</a>
     <a href="#modelmanager" data-page="modelmanager">Model Manager</a>
     <a href="#providers" data-page="providers">Providers</a>
@@ -23,6 +23,7 @@
   </nav>
   <div class="header-right">
     <span id="conn-dot" class="dot" title="connection"></span>
+    <button id="theme-btn" class="btn small" title="Toggle light/dark theme (UPM design standard)">Theme</button>
     <button id="token-btn" class="btn small hidden" title="Authentication">Key</button>
   </div>
 </header>

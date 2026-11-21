@@ -3,6 +3,7 @@ package ai.enr.manager.provider;
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
+import ai.enr.core.json.JsonString;
 import ai.enr.core.json.JsonValue;
 
 import java.io.BufferedReader;
@@ -27,23 +28,25 @@ import java.util.function.Consumer;
 public final class ProviderClient implements AutoCloseable {
 
     public record ChatOptions(int maxTokens, Float temperature, Float topP, Integer topK,
-                              Long seed, List<String> stop, boolean stream) {
+                              Long seed, List<String> stop, boolean stream, JsonArray tools) {
 
         public static ChatOptions defaults() {
-            return new ChatOptions(256, null, null, null, null, List.of(), false);
+            return new ChatOptions(256, null, null, null, null, List.of(), false, null);
         }
     }
 
     public record ChatResult(String content, int promptTokens, int completionTokens,
-                             String finishReason, long elapsedMs, boolean ok, String error) {
+                             String finishReason, long elapsedMs, boolean ok, String error,
+                             JsonValue toolCalls, String reasoningContent) {
 
         public static ChatResult error(String message) {
-            return new ChatResult("", 0, 0, "error", 0, false, message);
+            return new ChatResult("", 0, 0, "error", 0, false, message, null, null);
         }
     }
 
     public record StreamChunk(String content, boolean done, String finishReason,
-                              int promptTokens, int completionTokens) {
+                              int promptTokens, int completionTokens, JsonValue toolCalls,
+                              String reasoningContent) {
     }
 
     public record TestResult(boolean ok, String message, long elapsedMs, List<String> models) {
@@ -140,17 +143,25 @@ public final class ProviderClient implements AutoCloseable {
         JsonArray choices = obj.getArray("choices");
         String content = "";
         String finish = "stop";
+        JsonValue toolCalls = null;
+        String reasoning = null;
         if (choices != null && choices.size() > 0) {
             JsonObject first = choices.getObject(0);
             JsonObject message = first.getObject("message");
             content = message == null ? "" : message.getString("content", "");
+            if (message != null) {
+                toolCalls = parsedToolCalls(message.get("tool_calls"));
+                if (message.get("reasoning_content") != null) {
+                    reasoning = message.getString("reasoning_content", "");
+                }
+            }
             finish = first.getString("finish_reason", "stop");
         }
         JsonObject usage = obj.getObject("usage");
         return new ChatResult(content,
                 usage == null ? 0 : usage.getInt("prompt_tokens", 0),
                 usage == null ? 0 : usage.getInt("completion_tokens", 0),
-                finish, System.currentTimeMillis(), true, "");
+                finish, System.currentTimeMillis(), true, "", toolCalls, reasoning);
     }
 
     private void openAiStream(Provider provider, String model, List<ChatMessage> messages,
@@ -166,6 +177,12 @@ public final class ProviderClient implements AutoCloseable {
             String err = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
             throw new IllegalStateException("HTTP " + response.statusCode() + ": " + shortBody(err));
         }
+        java.util.Map<Integer, String> callIds = new java.util.LinkedHashMap<>();
+        java.util.Map<Integer, StringBuilder> callNames = new java.util.LinkedHashMap<>();
+        java.util.Map<Integer, StringBuilder> callArguments = new java.util.LinkedHashMap<>();
+        StringBuilder reasoning = new StringBuilder();
+        int[] usageTokens = {0, 0};
+        boolean[] finished = {false};
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.body(),
                 StandardCharsets.UTF_8))) {
             String line;
@@ -182,23 +199,198 @@ public final class ProviderClient implements AutoCloseable {
                 if (choices == null || choices.size() == 0) {
                     JsonObject usage = chunk.getObject("usage");
                     if (usage != null) {
-                        onChunk.accept(new StreamChunk("", true, "stop",
-                                usage.getInt("prompt_tokens", 0),
-                                usage.getInt("completion_tokens", 0)));
+                        usageTokens[0] = usage.getInt("prompt_tokens", 0);
+                        usageTokens[1] = usage.getInt("completion_tokens", 0);
+                        if (!finished[0]) {
+                            onChunk.accept(new StreamChunk("", true, "stop", usageTokens[0],
+                                    usageTokens[1], aggregateToolCalls(callIds, callNames, callArguments),
+                                    reasoning.length() > 0 ? reasoning.toString() : null));
+                            finished[0] = true;
+                        }
                     }
                     continue;
                 }
+                if (finished[0]) {
+                    continue;
+                }
                 JsonObject first = choices.getObject(0);
-                JsonObject delta = first.getObject("delta");
+                JsonObject delta = first == null ? null : first.getObject("delta");
+                if (delta != null) {
+                    String reasoningDelta = delta.getString("reasoning_content");
+                    if (reasoningDelta != null && !reasoningDelta.isEmpty()) {
+                        reasoning.append(reasoningDelta);
+                    }
+                    JsonArray toolDeltas = delta.getArray("tool_calls");
+                    if (toolDeltas != null) {
+                        for (int i = 0; i < toolDeltas.size(); i++) {
+                            JsonObject toolDelta = toolDeltas.getObject(i);
+                            if (toolDelta == null) {
+                                continue;
+                            }
+                            int index = toolDelta.getInt("index", 0);
+                            String id = toolDelta.getString("id");
+                            if (id != null && !id.isBlank()) {
+                                callIds.put(index, id);
+                            }
+                            JsonObject function = toolDelta.getObject("function");
+                            if (function != null) {
+                                String name = function.getString("name");
+                                String arguments = function.getString("arguments");
+                                if (name != null && !name.isEmpty()) {
+                                    callNames.computeIfAbsent(index, k -> new StringBuilder()).append(name);
+                                }
+                                if (arguments != null && !arguments.isEmpty()) {
+                                    callArguments.computeIfAbsent(index, k -> new StringBuilder())
+                                            .append(arguments);
+                                }
+                            }
+                        }
+                    }
+                }
                 String piece = delta == null ? "" : delta.getString("content", "");
-                String finish = first.getString("finish_reason");
+                String finish = first == null ? null : first.getString("finish_reason");
                 if (finish != null && !finish.isBlank()) {
-                    onChunk.accept(new StreamChunk(piece, true, finish, 0, 0));
+                    JsonValue toolCalls = aggregateToolCalls(callIds, callNames, callArguments);
+                    String effectiveFinish = toolCalls != null ? "tool_calls" : finish;
+                    onChunk.accept(new StreamChunk(piece, true, effectiveFinish, usageTokens[0],
+                            usageTokens[1], toolCalls,
+                            reasoning.length() > 0 ? reasoning.toString() : null));
+                    finished[0] = true;
                 } else if (piece != null && !piece.isEmpty()) {
-                    onChunk.accept(new StreamChunk(piece, false, null, 0, 0));
+                    onChunk.accept(new StreamChunk(piece, false, null, 0, 0, null, null));
                 }
             }
         }
+        if (!finished[0]) {
+            JsonValue toolCalls = aggregateToolCalls(callIds, callNames, callArguments);
+            String finish = toolCalls != null ? "tool_calls" : "stop";
+            onChunk.accept(new StreamChunk("", true, finish, usageTokens[0], usageTokens[1], toolCalls,
+                    reasoning.length() > 0 ? reasoning.toString() : null));
+        }
+    }
+
+    /**
+     * Aggregates streamed tool-call deltas into a canonical tool_calls array:
+     * {@code [{"id","type":"function","function":{"name","arguments":<object>}}]}.
+     * Arguments are parsed from their JSON string form when possible; invalid
+     * JSON is preserved as a string. Returns null when nothing accumulated.
+     */
+    private static JsonValue aggregateToolCalls(java.util.Map<Integer, String> ids,
+                                                java.util.Map<Integer, StringBuilder> names,
+                                                java.util.Map<Integer, StringBuilder> arguments) {
+        if (names.isEmpty() && arguments.isEmpty()) {
+            return null;
+        }
+        JsonArray toolCalls = new JsonArray();
+        java.util.Set<Integer> indexes = new java.util.TreeSet<>();
+        indexes.addAll(names.keySet());
+        indexes.addAll(arguments.keySet());
+        for (int index : indexes) {
+            JsonObject call = new JsonObject();
+            String id = ids.get(index);
+            call.put("id", id == null ? "call_" + index : id);
+            call.put("type", "function");
+            JsonObject function = new JsonObject();
+            function.put("name", names.containsKey(index) ? names.get(index).toString() : "");
+            StringBuilder args = arguments.get(index);
+            if (args != null) {
+                function.put("arguments", parseArguments(args.toString()));
+            } else {
+                function.put("arguments", new JsonObject());
+            }
+            call.put("function", function);
+            toolCalls.add(call);
+        }
+        return toolCalls;
+    }
+
+    /**
+     * Serializes canonical tool calls into the OpenAI request wire format:
+     * {@code arguments} must be a JSON string (OpenAI contract), even when the
+     * canonical form carries a parsed object (e.g. from Ollama-format input).
+     */
+    public static JsonArray openAiWireToolCalls(JsonValue toolCalls) {
+        JsonArray result = new JsonArray();
+        if (!(toolCalls instanceof JsonArray arr)) {
+            return result;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject entry = arr.getObject(i);
+            if (entry == null) {
+                continue;
+            }
+            JsonObject call = new JsonObject();
+            String id = entry.getString("id");
+            call.put("id", id == null || id.isBlank() ? "call_" + i : id);
+            String type = entry.getString("type");
+            call.put("type", type == null || type.isBlank() ? "function" : type);
+            JsonObject function = entry.getObject("function");
+            JsonObject normalized = new JsonObject();
+            if (function != null) {
+                normalized.put("name", function.getString("name", ""));
+                JsonValue arguments = function.get("arguments");
+                if (arguments instanceof JsonString s) {
+                    normalized.put("arguments", s.value());
+                } else if (arguments != null) {
+                    normalized.put("arguments", Json.write(arguments, false));
+                } else {
+                    normalized.put("arguments", "{}");
+                }
+            } else {
+                normalized.put("name", "");
+                normalized.put("arguments", "{}");
+            }
+            call.put("function", normalized);
+            result.add(call);
+        }
+        return result;
+    }
+
+    /** Parses a JSON object string; falls back to the raw string when invalid. */
+    public static JsonValue parseArguments(String text) {
+        try {
+            return Json.parse(text.strip());
+        } catch (RuntimeException e) {
+            return new ai.enr.core.json.JsonString(text);
+        }
+    }
+
+    /** Normalizes provider tool_calls into the canonical form; returns null when absent. */
+    static JsonValue parsedToolCalls(JsonValue toolCalls) {
+        if (!(toolCalls instanceof JsonArray arr)) {
+            return null;
+        }
+        JsonArray result = new JsonArray();
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject entry = arr.getObject(i);
+            if (entry == null) {
+                continue;
+            }
+            JsonObject call = new JsonObject();
+            String id = entry.getString("id");
+            call.put("id", id == null || id.isBlank() ? "call_" + i : id);
+            String type = entry.getString("type");
+            call.put("type", type == null || type.isBlank() ? "function" : type);
+            JsonObject function = entry.getObject("function");
+            JsonObject normalizedFunction = new JsonObject();
+            if (function != null) {
+                normalizedFunction.put("name", function.getString("name", ""));
+                JsonValue arguments = function.get("arguments");
+                if (arguments instanceof JsonString s) {
+                    normalizedFunction.put("arguments", parseArguments(s.value()));
+                } else if (arguments != null) {
+                    normalizedFunction.put("arguments", arguments);
+                } else {
+                    normalizedFunction.put("arguments", new JsonObject());
+                }
+            } else {
+                normalizedFunction.put("name", "");
+                normalizedFunction.put("arguments", new JsonObject());
+            }
+            call.put("function", normalizedFunction);
+            result.add(call);
+        }
+        return result.size() > 0 ? result : null;
     }
 
     private JsonObject openAiBody(String model, List<ChatMessage> messages, ChatOptions options,
@@ -206,9 +398,38 @@ public final class ProviderClient implements AutoCloseable {
         JsonObject body = new JsonObject();
         body.put("model", model);
         JsonArray arr = new JsonArray();
+        java.util.ArrayDeque<String> pendingToolIds = new java.util.ArrayDeque<>();
         for (ChatMessage message : messages) {
             JsonObject entry = new JsonObject();
             entry.put("role", message.role());
+            JsonObject payload = message.payload();
+            if ("assistant".equals(message.role()) && payload != null
+                    && payload.get("tool_calls") != null) {
+                JsonArray wire = openAiWireToolCalls(payload.get("tool_calls"));
+                pendingToolIds.clear();
+                for (int i = 0; i < wire.size(); i++) {
+                    pendingToolIds.add(wire.getObject(i).getString("id", ""));
+                }
+                entry.put("tool_calls", wire);
+                if (payload.get("reasoning_content") != null) {
+                    entry.put("reasoning_content", payload.get("reasoning_content"));
+                }
+            } else if ("assistant".equals(message.role()) && payload != null
+                    && payload.get("reasoning_content") != null) {
+                entry.put("reasoning_content", payload.get("reasoning_content"));
+            } else if ("tool".equals(message.role())) {
+                JsonValue toolCallId = payload == null ? null : payload.get("tool_call_id");
+                if (toolCallId != null) {
+                    entry.put("tool_call_id", toolCallId);
+                } else if (!pendingToolIds.isEmpty()) {
+                    entry.put("tool_call_id", pendingToolIds.poll());
+                }
+            } else if (payload != null) {
+                JsonValue toolCallId = payload.get("tool_call_id");
+                if (toolCallId != null) {
+                    entry.put("tool_call_id", toolCallId);
+                }
+            }
             entry.put("content", message.content());
             arr.add(entry);
         }
@@ -218,6 +439,9 @@ public final class ProviderClient implements AutoCloseable {
             JsonObject streamOptions = new JsonObject();
             streamOptions.put("include_usage", true);
             body.put("stream_options", streamOptions);
+        }
+        if (options.tools() != null && options.tools().size() > 0) {
+            body.put("tools", options.tools());
         }
         if (options.maxTokens() > 0) {
             body.put("max_tokens", options.maxTokens());
@@ -321,7 +545,7 @@ public final class ProviderClient implements AutoCloseable {
         return new ChatResult(content.toString(),
                 usage == null ? 0 : usage.getInt("input_tokens", 0),
                 usage == null ? 0 : usage.getInt("output_tokens", 0),
-                obj.getString("stop_reason", "end_turn"), System.currentTimeMillis(), true, "");
+                obj.getString("stop_reason", "end_turn"), System.currentTimeMillis(), true, "", null, null);
     }
 
     private void anthropicStream(Provider provider, String model, List<ChatMessage> messages,
@@ -356,7 +580,7 @@ public final class ProviderClient implements AutoCloseable {
                         if (delta != null) {
                             String text = delta.getString("text", "");
                             if (!text.isEmpty()) {
-                                onChunk.accept(new StreamChunk(text, false, null, 0, 0));
+                                onChunk.accept(new StreamChunk(text, false, null, 0, 0, null, null));
                             }
                         }
                     }
@@ -366,9 +590,9 @@ public final class ProviderClient implements AutoCloseable {
                         JsonObject usage = event.getObject("usage");
                         onChunk.accept(new StreamChunk("", true, stop,
                                 usage == null ? 0 : usage.getInt("input_tokens", 0),
-                                usage == null ? 0 : usage.getInt("output_tokens", 0)));
+                                usage == null ? 0 : usage.getInt("output_tokens", 0), null, null));
                     }
-                    case "message_stop" -> onChunk.accept(new StreamChunk("", true, "end_turn", 0, 0));
+                    case "message_stop" -> onChunk.accept(new StreamChunk("", true, "end_turn", 0, 0, null, null));
                     case "error" -> throw new IllegalStateException(
                             event.getObject("error") == null ? "stream error"
                                     : event.getObject("error").getString("message", "stream error"));
@@ -464,7 +688,7 @@ public final class ProviderClient implements AutoCloseable {
         return new ChatResult(content,
                 usage == null ? 0 : usage.getInt("promptTokenCount", 0),
                 usage == null ? 0 : usage.getInt("candidatesTokenCount", 0),
-                finish, System.currentTimeMillis(), true, "");
+                finish, System.currentTimeMillis(), true, "", null, null);
     }
 
     private void geminiStream(Provider provider, String model, List<ChatMessage> messages,
@@ -509,7 +733,7 @@ public final class ProviderClient implements AutoCloseable {
                         }
                     }
                     if (text.length() > 0) {
-                        onChunk.accept(new StreamChunk(text.toString(), false, null, 0, 0));
+                        onChunk.accept(new StreamChunk(text.toString(), false, null, 0, 0, null, null));
                     }
                 }
                 String finish = candidate == null ? null : candidate.getString("finishReason");
@@ -517,7 +741,7 @@ public final class ProviderClient implements AutoCloseable {
                     JsonObject usage = chunk.getObject("usageMetadata");
                     onChunk.accept(new StreamChunk("", true, finish,
                             usage == null ? 0 : usage.getInt("promptTokenCount", 0),
-                            usage == null ? 0 : usage.getInt("candidatesTokenCount", 0)));
+                            usage == null ? 0 : usage.getInt("candidatesTokenCount", 0), null, null));
                 }
             }
         }

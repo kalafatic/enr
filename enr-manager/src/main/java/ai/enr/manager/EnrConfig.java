@@ -29,7 +29,9 @@ public record EnrConfig(
         String ollamaSearchUrl,
         String huggingFaceApiUrl,
         long downloadTimeoutMs,
-        JsonObject modelProviders) {
+        JsonObject modelProviders,
+        boolean webUiEnabled,
+        boolean webUiAutoStart) {
 
     public static Builder builder() {
         return new Builder();
@@ -59,6 +61,8 @@ public record EnrConfig(
         private String huggingFaceApiUrl = "https://huggingface.co";
         private long downloadTimeoutMs = 0;
         private JsonObject modelProviders = new JsonObject();
+        private boolean webUiEnabled = true;
+        private boolean webUiAutoStart = true;
 
         public Builder host(String host) {
             this.host = host;
@@ -155,12 +159,22 @@ public record EnrConfig(
             return this;
         }
 
+        public Builder webUiEnabled(boolean enabled) {
+            this.webUiEnabled = enabled;
+            return this;
+        }
+
+        public Builder webUiAutoStart(boolean autoStart) {
+            this.webUiAutoStart = autoStart;
+            return this;
+        }
+
         public EnrConfig build() {
             return new EnrConfig(host, port, dataDir, modelsDir, logDir, modelDirectories,
                     preferredBackend, allowCudaFallback, maxConcurrentSessions, defaultMaxTokens,
                     sessionIdleTimeoutSeconds, requestTimeoutSeconds, enableMetrics,
                     authToken, ollamaRegistryUrl, ollamaSearchUrl, huggingFaceApiUrl,
-                    downloadTimeoutMs, modelProviders);
+                    downloadTimeoutMs, modelProviders, webUiEnabled, webUiAutoStart);
         }
     }
 }

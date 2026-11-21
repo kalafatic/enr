@@ -29,7 +29,7 @@ final class OllamaApiHandlers {
     static HttpHandler tags(EnrManager manager) {
         return exchange -> {
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only GET allowed");
+                sendOllamaError(exchange, 405, "Only GET allowed");
                 return;
             }
             JsonObject body = new JsonObject();
@@ -41,15 +41,18 @@ final class OllamaApiHandlers {
     static HttpHandler show(EnrManager manager) {
         return exchange -> {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                sendOllamaError(exchange, 405, "Only POST allowed");
                 return;
             }
             try {
                 JsonObject request = HttpSupport.parseBodyObject(exchange);
                 String name = request.getString("name", "");
+                if (name.isBlank()) {
+                    name = request.getString("model", "");
+                }
                 HttpSupport.sendJson(exchange, 200, manager.ollamaShow(name));
             } catch (IllegalArgumentException e) {
-                HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
+                sendOllamaError(exchange, 404, e.getMessage());
             }
         };
     }
@@ -57,14 +60,14 @@ final class OllamaApiHandlers {
     static HttpHandler pull(EnrManager manager) {
         return exchange -> {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                sendOllamaError(exchange, 405, "Only POST allowed");
                 return;
             }
             JsonObject request = HttpSupport.parseBodyObject(exchange);
             String name = request.getString("name", "");
             boolean stream = request.getBoolean("stream", true);
             if (name.isBlank()) {
-                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'name' field");
+                sendOllamaError(exchange, 400, "Missing 'name' field");
                 return;
             }
             if (!stream) {
@@ -141,14 +144,14 @@ final class OllamaApiHandlers {
         try {
             jobId = manager.pullModel(name);
         } catch (Exception e) {
-            HttpSupport.sendError(exchange, 500, "PULL_FAILED", e.getMessage() == null
+            sendOllamaError(exchange, 500, e.getMessage() == null
                     ? e.getClass().getSimpleName() : e.getMessage());
             return;
         }
         while (true) {
             var job = manager.downloads().get(jobId);
             if (job.isEmpty()) {
-                HttpSupport.sendError(exchange, 500, "PULL_FAILED", "download job disappeared");
+                sendOllamaError(exchange, 500, "download job disappeared");
                 return;
             }
             var current = job.get();
@@ -160,11 +163,11 @@ final class OllamaApiHandlers {
                     return;
                 }
                 case FAILED -> {
-                    HttpSupport.sendError(exchange, 500, "PULL_FAILED", current.error());
+                    sendOllamaError(exchange, 500, current.error());
                     return;
                 }
                 case CANCELLED -> {
-                    HttpSupport.sendError(exchange, 409, "PULL_CANCELLED", "download cancelled");
+                    sendOllamaError(exchange, 409, "download cancelled");
                     return;
                 }
                 default -> {
@@ -182,25 +185,23 @@ final class OllamaApiHandlers {
     static HttpHandler delete(EnrManager manager) {
         return exchange -> {
             if (!"DELETE".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only DELETE allowed");
+                sendOllamaError(exchange, 405, "Only DELETE allowed");
                 return;
             }
             try {
                 JsonObject request = HttpSupport.parseBodyObject(exchange);
                 String name = request.getString("name", "");
                 if (name.isBlank()) {
-                    HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'name' field");
+                    sendOllamaError(exchange, 400, "Missing 'name' field");
                     return;
                 }
                 manager.removeModel(name);
                 exchange.sendResponseHeaders(200, -1);
                 exchange.close();
             } catch (IllegalArgumentException e) {
-                JsonObject error = new JsonObject();
-                error.put("error", e.getMessage());
-                HttpSupport.sendJson(exchange, 404, error);
+                sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
-                HttpSupport.sendError(exchange, 500, "DELETE_FAILED", e.getMessage());
+                sendOllamaError(exchange, 500, e.getMessage());
             }
         };
     }
@@ -208,7 +209,7 @@ final class OllamaApiHandlers {
     static HttpHandler chat(EnrManager manager) {
         return exchange -> {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                sendOllamaError(exchange, 405, "Only POST allowed");
                 return;
             }
             try {
@@ -218,14 +219,14 @@ final class OllamaApiHandlers {
                 boolean stream = request.getBoolean("stream", false);
                 EnrManager.ChatOptions options = optionsFrom(request, stream);
                 if (model.isBlank()) {
-                    HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'model' field");
+                    sendOllamaError(exchange, 400, "Missing 'model' field");
                     return;
                 }
+                manager.validateTools(model, options);
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
                     if (result.has("error")) {
-                        HttpSupport.sendError(exchange, 500, "INFERENCE_FAILED",
-                                result.getString("error", "inference failed"));
+                        sendOllamaError(exchange, 500, result.getString("error", "inference failed"));
                         return;
                     }
                     JsonObject response = new JsonObject();
@@ -234,6 +235,14 @@ final class OllamaApiHandlers {
                     JsonObject message = new JsonObject();
                     message.put("role", "assistant");
                     message.put("content", result.getString("content", ""));
+                    JsonValue toolCalls = result.get("tool_calls");
+                    if (toolCalls != null) {
+                        message.put("tool_calls", toOllamaToolCalls(toolCalls));
+                    }
+                    JsonValue reasoning = result.get("reasoning_content");
+                    if (reasoning != null) {
+                        message.put("thinking", reasoning);
+                    }
                     response.put("message", message);
                     response.put("done", true);
                     response.put("done_reason", result.getString("finish_reason", "stop"));
@@ -254,6 +263,16 @@ final class OllamaApiHandlers {
                             JsonObject message = new JsonObject();
                             message.put("role", "assistant");
                             message.put("content", chunk.getString("content", ""));
+                            if (chunk.getBoolean("done", false)) {
+                                JsonValue toolCalls = chunk.get("tool_calls");
+                                if (toolCalls != null) {
+                                    message.put("tool_calls", toOllamaToolCalls(toolCalls));
+                                }
+                                JsonValue reasoning = chunk.get("reasoning_content");
+                                if (reasoning != null) {
+                                    message.put("thinking", reasoning);
+                                }
+                            }
                             line.put("message", message);
                             line.put("done", chunk.getBoolean("done", false));
                             if (chunk.getBoolean("done", false)) {
@@ -270,10 +289,12 @@ final class OllamaApiHandlers {
                 } catch (RuntimeException ignored) {
                     // client disconnected
                 }
+            } catch (EnrManager.ToolCallingUnsupportedException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
-                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
+                sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
-                HttpSupport.sendError(exchange, 500, "INFERENCE_FAILED", e.getMessage());
+                sendOllamaError(exchange, 500, e.getMessage());
             }
         };
     }
@@ -281,7 +302,7 @@ final class OllamaApiHandlers {
     static HttpHandler generate(EnrManager manager) {
         return exchange -> {
             if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                sendOllamaError(exchange, 405, "Only POST allowed");
                 return;
             }
             try {
@@ -290,13 +311,17 @@ final class OllamaApiHandlers {
                 String prompt = request.getString("prompt", "");
                 boolean stream = request.getBoolean("stream", false);
                 if (model.isBlank()) {
-                    HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'model' field");
+                    sendOllamaError(exchange, 400, "Missing 'model' field");
                     return;
                 }
                 List<ChatMessage> messages = List.of(ChatMessage.of("user", prompt));
                 EnrManager.ChatOptions options = optionsFrom(request, stream);
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
+                    if (result.has("error")) {
+                        sendOllamaError(exchange, 500, result.getString("error", "inference failed"));
+                        return;
+                    }
                     JsonObject response = new JsonObject();
                     response.put("model", model);
                     response.put("created_at", java.time.Instant.now().toString());
@@ -333,10 +358,12 @@ final class OllamaApiHandlers {
                 } catch (RuntimeException ignored) {
                     // client disconnected
                 }
+            } catch (EnrManager.ToolCallingUnsupportedException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
-                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
+                sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
-                HttpSupport.sendError(exchange, 500, "INFERENCE_FAILED", e.getMessage());
+                sendOllamaError(exchange, 500, e.getMessage());
             }
         };
     }
@@ -344,7 +371,7 @@ final class OllamaApiHandlers {
     static HttpHandler ps(EnrManager manager) {
         return exchange -> {
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only GET allowed");
+                sendOllamaError(exchange, 405, "Only GET allowed");
                 return;
             }
             HttpSupport.sendJson(exchange, 200, manager.ollamaPs());
@@ -354,7 +381,7 @@ final class OllamaApiHandlers {
     static HttpHandler version(EnrManager manager) {
         return exchange -> {
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only GET allowed");
+                sendOllamaError(exchange, 405, "Only GET allowed");
                 return;
             }
             HttpSupport.sendJson(exchange, 200, manager.version());
@@ -367,6 +394,7 @@ final class OllamaApiHandlers {
         if (arr == null) {
             return messages;
         }
+        int[] callCounter = {0};
         for (int i = 0; i < arr.size(); i++) {
             JsonObject entry = arr.getObject(i);
             if (entry == null) {
@@ -377,9 +405,91 @@ final class OllamaApiHandlers {
             if (images != null && images.size() > 0 && content.isEmpty()) {
                 content = "[image input]";
             }
-            messages.add(ChatMessage.of(entry.getString("role", "user"), content));
+            JsonObject payload = null;
+            JsonArray toolCalls = entry.getArray("tool_calls");
+            if (toolCalls != null && toolCalls.size() > 0) {
+                payload = new JsonObject();
+                payload.put("tool_calls", canonicalToolCallsFromOllama(toolCalls, callCounter));
+            }
+            JsonValue thinking = entry.get("thinking");
+            if (thinking != null) {
+                if (payload == null) {
+                    payload = new JsonObject();
+                }
+                payload.put("reasoning_content", thinking);
+            }
+            messages.add(ChatMessage.withPayload(entry.getString("role", "user"), content, payload));
         }
         return messages;
+    }
+
+    /**
+     * Converts Ollama-format tool calls ({@code {function:{name,arguments}}})
+     * into the canonical form ({@code {id,type,function:{...}}}) used by the
+     * manager/provider layer.
+     */
+    private static JsonArray canonicalToolCallsFromOllama(JsonArray toolCalls, int[] callCounter) {
+        JsonArray result = new JsonArray();
+        for (int i = 0; i < toolCalls.size(); i++) {
+            JsonObject entry = toolCalls.getObject(i);
+            if (entry == null) {
+                continue;
+            }
+            JsonObject function = entry.getObject("function");
+            JsonObject call = new JsonObject();
+            call.put("id", "call_" + callCounter[0]++);
+            call.put("type", "function");
+            JsonObject normalized = new JsonObject();
+            if (function != null) {
+                normalized.put("name", function.getString("name", ""));
+                JsonValue arguments = function.get("arguments");
+                normalized.put("arguments", arguments == null ? new JsonObject() : arguments);
+            } else {
+                normalized.put("name", "");
+                normalized.put("arguments", new JsonObject());
+            }
+            call.put("function", normalized);
+            result.add(call);
+        }
+        return result;
+    }
+
+    /**
+     * Converts canonical tool calls back into the Ollama response format
+     * ({@code [{function:{name,arguments}}]}) with arguments serialized as
+     * objects.
+     */
+    private static JsonArray toOllamaToolCalls(JsonValue toolCalls) {
+        JsonArray result = new JsonArray();
+        if (!(toolCalls instanceof JsonArray arr)) {
+            return result;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JsonObject entry = arr.getObject(i);
+            if (entry == null) {
+                continue;
+            }
+            JsonObject function = entry.getObject("function");
+            JsonObject call = new JsonObject();
+            JsonObject normalized = new JsonObject();
+            if (function != null) {
+                normalized.put("name", function.getString("name", ""));
+                JsonValue arguments = function.get("arguments");
+                if (arguments instanceof ai.enr.core.json.JsonString s) {
+                    normalized.put("arguments", ai.enr.manager.provider.ProviderClient.parseArguments(s.value()));
+                } else if (arguments != null) {
+                    normalized.put("arguments", arguments);
+                } else {
+                    normalized.put("arguments", new JsonObject());
+                }
+            } else {
+                normalized.put("name", "");
+                normalized.put("arguments", new JsonObject());
+            }
+            call.put("function", normalized);
+            result.add(call);
+        }
+        return result;
     }
 
     private static EnrManager.ChatOptions optionsFrom(JsonObject request, boolean stream) {
@@ -412,7 +522,8 @@ final class OllamaApiHandlers {
             maxTokens = request.getInt("num_predict", -1);
         }
         int effectiveMaxTokens = maxTokens != null ? maxTokens : defaults.maxTokens();
-        return new EnrManager.ChatOptions(effectiveMaxTokens, temperature, topP, topK, seed, stop, stream);
+        return new EnrManager.ChatOptions(effectiveMaxTokens, temperature, topP, topK, seed, stop, stream,
+                request.getArray("tools"));
     }
 
     private static JsonObject errorLine(String message) {
@@ -425,5 +536,12 @@ final class OllamaApiHandlers {
         JsonObject line = new JsonObject();
         line.put("status", status);
         HttpSupport.sendNdJson(out, line);
+    }
+
+    /** Ollama error responses use a plain string error field. */
+    private static void sendOllamaError(HttpExchange exchange, int status, String message) throws IOException {
+        JsonObject body = new JsonObject();
+        body.put("error", message == null ? "unknown error" : message);
+        HttpSupport.sendJson(exchange, status, body);
     }
 }

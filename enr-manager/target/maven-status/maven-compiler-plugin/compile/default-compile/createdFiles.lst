@@ -3,6 +3,7 @@ ai/enr/manager/models/ModelManagementService$Listener.class
 ai/enr/manager/models/ollama/OllamaModelProvider.class
 ai/enr/manager/models/DownloadLayer.class
 ai/enr/manager/models/DownloadProgress.class
+ai/enr/manager/EnrManager$ToolCallingUnsupportedException.class
 ai/enr/manager/models/ModelProviderFactory.class
 ai/enr/manager/EnrManager$2.class
 ai/enr/manager/models/ModelProvider.class

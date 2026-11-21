@@ -1074,6 +1074,22 @@ async function boot() {
     if (info.auth_required && !info.auth_ok && !state.token) promptToken();
   } catch { /* server not reachable */ }
   $("#token-btn").addEventListener("click", promptToken);
+  // Theme toggle: UPM design standard light/dark pair (default dark).
+  (function initTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem("enr.theme"); } catch (e) { /* ignore */ }
+    if (saved === "light" || saved === "dark") {
+      document.documentElement.dataset.theme = saved;
+    }
+    const btn = $("#theme-btn");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        try { localStorage.setItem("enr.theme", next); } catch (e) { /* ignore */ }
+      });
+    }
+  })();
   setInterval(ping, 5000);
   ping();
   window.addEventListener("hashchange", () => {

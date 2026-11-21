@@ -3,6 +3,7 @@ package ai.enr.server;
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
+import ai.enr.core.json.JsonValue;
 import ai.enr.manager.EnrManager;
 import ai.enr.manager.provider.ChatMessage;
 import ai.enr.manager.provider.Provider;
@@ -66,6 +67,7 @@ final class OpenAiApiHandlers {
                     HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'model' field");
                     return;
                 }
+                manager.validateTools(model, options);
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
                     if (result.has("error")) {
@@ -102,6 +104,14 @@ final class OpenAiApiHandlers {
                                 if (finish.isBlank()) {
                                     finish = "stop";
                                 }
+                                JsonValue toolCalls = chunk.get("tool_calls");
+                                if (toolCalls != null) {
+                                    delta.put("tool_calls", toOpenAiToolCalls(toolCalls));
+                                }
+                                JsonValue reasoning = chunk.get("reasoning_content");
+                                if (reasoning != null) {
+                                    delta.put("reasoning_content", reasoning);
+                                }
                                 choice.put("finish_reason", finish);
                                 finishReason[0] = finish;
                                 promptTokens[0] = chunk.getInt("prompt_tokens", 0);
@@ -132,6 +142,8 @@ final class OpenAiApiHandlers {
                 } catch (RuntimeException ignored) {
                     // client disconnected
                 }
+            } catch (EnrManager.ToolCallingUnsupportedException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
             } catch (Exception e) {
@@ -262,6 +274,14 @@ final class OpenAiApiHandlers {
         JsonObject message = new JsonObject();
         message.put("role", "assistant");
         message.put("content", result.getString("content", ""));
+        JsonValue toolCalls = result.get("tool_calls");
+        if (toolCalls != null) {
+            message.put("tool_calls", toOpenAiToolCalls(toolCalls));
+        }
+        JsonValue reasoning = result.get("reasoning_content");
+        if (reasoning != null) {
+            message.put("reasoning_content", reasoning);
+        }
         choice.put("message", message);
         choice.put("finish_reason", result.getString("finish_reason", "stop"));
         choices.add(choice);
@@ -300,9 +320,36 @@ final class OpenAiApiHandlers {
                     content = text.toString();
                 }
             }
-            messages.add(ChatMessage.of(entry.getString("role", "user"), content));
+            JsonObject payload = null;
+            JsonArray toolCalls = entry.getArray("tool_calls");
+            String toolCallId = entry.getString("tool_call_id");
+            if (toolCalls != null || (toolCallId != null && !toolCallId.isEmpty())) {
+                payload = new JsonObject();
+                if (toolCalls != null) {
+                    payload.put("tool_calls", toolCalls);
+                }
+                if (toolCallId != null && !toolCallId.isEmpty()) {
+                    payload.put("tool_call_id", toolCallId);
+                }
+            }
+            JsonValue reasoning = entry.get("reasoning_content");
+            if (reasoning != null) {
+                if (payload == null) {
+                    payload = new JsonObject();
+                }
+                payload.put("reasoning_content", reasoning);
+            }
+            messages.add(ChatMessage.withPayload(entry.getString("role", "user"), content, payload));
         }
         return messages;
+    }
+
+    /**
+     * Serializes canonical tool calls into the OpenAI wire format (shared
+     * converter from the provider layer; arguments as a compact JSON string).
+     */
+    private static JsonArray toOpenAiToolCalls(JsonValue toolCalls) {
+        return ai.enr.manager.provider.ProviderClient.openAiWireToolCalls(toolCalls);
     }
 
     private static EnrManager.ChatOptions chatOptionsFrom(JsonObject request, boolean stream) {
@@ -324,6 +371,6 @@ final class OpenAiApiHandlers {
         }
         return new EnrManager.ChatOptions(
                 maxTokens == null ? defaults.maxTokens() : maxTokens,
-                temperature, topP, topK, seed, stop, stream);
+                temperature, topP, topK, seed, stop, stream, request.getArray("tools"));
     }
 }

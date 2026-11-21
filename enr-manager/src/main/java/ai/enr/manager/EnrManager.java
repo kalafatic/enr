@@ -43,10 +43,22 @@ import java.util.logging.Logger;
 public final class EnrManager implements AutoCloseable {
 
     public record ChatOptions(int maxTokens, Float temperature, Float topP, Integer topK,
-                              Long seed, List<String> stop, boolean stream) {
+                              Long seed, List<String> stop, boolean stream, JsonArray tools) {
 
         public static ChatOptions defaults() {
-            return new ChatOptions(256, null, null, null, null, List.of(), false);
+            return new ChatOptions(256, null, null, null, null, List.of(), false, null);
+        }
+    }
+
+    /**
+     * Raised when a chat request carries tool definitions but the resolved
+     * route cannot produce structured tool calls (text-only local models or
+     * providers whose tool protocol is not translated). Handlers map this to
+     * HTTP 400, mirroring real Ollama behavior.
+     */
+    public static final class ToolCallingUnsupportedException extends IllegalArgumentException {
+        public ToolCallingUnsupportedException(String message) {
+            super(message);
         }
     }
 
@@ -426,6 +438,7 @@ public final class EnrManager implements AutoCloseable {
 
     public JsonObject chat(String modelName, List<ChatMessage> messages, ChatOptions options) {
         long started = System.currentTimeMillis();
+        validateTools(modelName, options);
         ModelRouter.Route route = router.resolve(modelName);
         if (route.target() == ModelRouter.Route.Target.LOCAL) {
             return chatLocal(route.modelId(), messages, options, started);
@@ -437,6 +450,7 @@ public final class EnrManager implements AutoCloseable {
     public void chatStream(String modelName, List<ChatMessage> messages, ChatOptions options,
                            Consumer<JsonObject> onChunk) throws IOException {
         long started = System.currentTimeMillis();
+        validateTools(modelName, options);
         ModelRouter.Route route = router.resolve(modelName);
         if (route.target() == ModelRouter.Route.Target.LOCAL) {
             chatLocalStream(route.modelId(), messages, options, started, onChunk);
@@ -445,11 +459,21 @@ public final class EnrManager implements AutoCloseable {
                 providerClient.chatStream(route.provider(), route.modelId(), messages,
                         new ProviderClient.ChatOptions(options.maxTokens(), options.temperature(),
                                 options.topP(), options.topK(), options.seed(), options.stop(),
-                                options.stream()), chunk -> {
+                                options.stream(), options.tools()), chunk -> {
                             JsonObject obj = new JsonObject();
                             obj.put("content", chunk.content());
                             obj.put("done", chunk.done());
-                            obj.put("finish_reason", chunk.finishReason() == null ? "" : chunk.finishReason());
+                            String finish = chunk.finishReason();
+                            if ((finish == null || finish.isBlank()) && chunk.toolCalls() != null) {
+                                finish = "tool_calls";
+                            }
+                            obj.put("finish_reason", finish == null ? "" : finish);
+                            if (chunk.toolCalls() != null) {
+                                obj.put("tool_calls", chunk.toolCalls());
+                            }
+                            if (chunk.reasoningContent() != null) {
+                                obj.put("reasoning_content", chunk.reasoningContent());
+                            }
                             obj.put("prompt_tokens", chunk.promptTokens());
                             obj.put("completion_tokens", chunk.completionTokens());
                             obj.put("elapsed_ms", System.currentTimeMillis() - started);
@@ -516,13 +540,20 @@ public final class EnrManager implements AutoCloseable {
                                     ChatOptions options, long started, Object unused) {
         ProviderClient.ChatResult result = providerClient.chat(route.provider(), route.modelId(),
                 messages, new ProviderClient.ChatOptions(options.maxTokens(), options.temperature(),
-                        options.topP(), options.topK(), options.seed(), options.stop(), options.stream()));
+                        options.topP(), options.topK(), options.seed(), options.stop(), options.stream(),
+                        options.tools()));
         JsonObject response = new JsonObject();
         response.put("content", result.content());
         response.put("model", route.modelId());
         response.put("provider", route.provider().id());
         response.put("local", false);
         response.put("finish_reason", result.finishReason());
+        if (result.toolCalls() != null) {
+            response.put("tool_calls", result.toolCalls());
+        }
+        if (result.reasoningContent() != null) {
+            response.put("reasoning_content", result.reasoningContent());
+        }
         response.put("prompt_tokens", result.promptTokens());
         response.put("completion_tokens", result.completionTokens());
         response.put("elapsed_ms", System.currentTimeMillis() - started);
@@ -530,6 +561,29 @@ public final class EnrManager implements AutoCloseable {
             response.put("error", result.error());
         }
         return response;
+    }
+
+    /**
+     * Tool calling is only relayed for OpenAI-compatible provider routes and
+     * explicitly rejected everywhere else — never silently dropped. Local
+     * native models are text-only and cannot emit structured tool calls.
+     * Called by chat/chatStream and pre-flight by streaming handlers before
+     * response headers are committed.
+     */
+    public void validateTools(String modelName, ChatOptions options) {
+        if (options.tools() == null || options.tools().size() == 0) {
+            return;
+        }
+        ModelRouter.Route route = router.resolve(modelName);
+        if (route.target() == ModelRouter.Route.Target.LOCAL) {
+            throw new ToolCallingUnsupportedException("Model '" + modelName
+                    + "' does not support tools (local ENR models are text-only)");
+        }
+        ProviderType type = route.provider().type();
+        if (type == ProviderType.ANTHROPIC || type == ProviderType.GEMINI || type == ProviderType.NATIVE) {
+            throw new ToolCallingUnsupportedException("Tool calling is not supported for provider type "
+                    + type.id());
+        }
     }
 
     static String buildPrompt(List<ChatMessage> messages) {
@@ -613,7 +667,10 @@ public final class EnrManager implements AutoCloseable {
         server.put("api", "http://" + config.host() + ":" + config.port() + "/api/v1");
         server.put("ollama_api", "http://" + config.host() + ":" + config.port() + "/api");
         server.put("openai_api", "http://" + config.host() + ":" + config.port() + "/v1");
-        server.put("web_ui", "http://" + config.host() + ":" + config.port() + "/");
+        server.put("web_ui_enabled", config.webUiEnabled() && config.webUiAutoStart());
+        if (config.webUiEnabled() && config.webUiAutoStart()) {
+            server.put("web_ui", "http://" + config.host() + ":" + config.port() + "/");
+        }
         return server;
     }
 
@@ -693,6 +750,9 @@ public final class EnrManager implements AutoCloseable {
             details.put("parameter_size", "");
             details.put("quantization_level", "");
             entry.put("details", details);
+            JsonArray capabilities = new JsonArray();
+            capabilities.add("completion");
+            entry.put("capabilities", capabilities);
             models.add(entry);
         }
         return models;
@@ -714,10 +774,17 @@ public final class EnrManager implements AutoCloseable {
         details.put("parameter_size", "");
         details.put("quantization_level", "");
         response.put("details", details);
+        JsonArray capabilities = new JsonArray();
+        capabilities.add("completion");
+        response.put("capabilities", capabilities);
         ModelInstance loaded = runtime.models().get(name);
         if (loaded != null) {
             details.put("parameter_size", loaded.loadedModel().totalParameters() + " parameters");
             details.put("context_length", loaded.loadedModel().architecture().maxSeqLen());
+            JsonObject modelInfo = new JsonObject();
+            modelInfo.put("general.parameter_count", loaded.loadedModel().totalParameters());
+            modelInfo.put("general.context_length", loaded.loadedModel().architecture().maxSeqLen());
+            response.put("model_info", modelInfo);
         }
         return response;
     }

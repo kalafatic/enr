@@ -45,13 +45,13 @@ public final class EnrConfigLoader {
         JsonObject storage = config.getObject("storage");
         if (storage != null) {
             if (storage.has("data_dir")) {
-                builder.dataDir(Path.of(storage.getString("data_dir")).toAbsolutePath());
+                builder.dataDir(expandHome(storage.getString("data_dir")));
             }
             if (storage.has("models_dir")) {
-                builder.modelsDir(Path.of(storage.getString("models_dir")).toAbsolutePath());
+                builder.modelsDir(expandHome(storage.getString("models_dir")));
             }
             if (storage.has("log_dir")) {
-                builder.logDir(Path.of(storage.getString("log_dir")).toAbsolutePath());
+                builder.logDir(expandHome(storage.getString("log_dir")));
             }
         }
         JsonObject catalogs = config.getObject("catalogs");
@@ -65,7 +65,30 @@ public final class EnrConfigLoader {
         if (modelProviders != null) {
             builder.modelProviders(modelProviders);
         }
+        JsonObject webServer = config.getObject("web_server");
+        if (webServer != null) {
+            builder.webUiEnabled(webServer.getBoolean("enabled", true));
+            builder.webUiAutoStart(webServer.getBoolean("auto_start", true));
+        }
         return builder.build();
+    }
+
+    /**
+     * Resolves a storage path to an absolute path, expanding a leading {@code ~}
+     * or {@code ~/} to the user home directory. Without this, {@code ~/.enr}
+     * in enr.yaml is created as a literal {@code ~} directory under the
+     * process working directory.
+     */
+    public static Path expandHome(String value) {
+        String trimmed = value.strip();
+        String home = System.getProperty("user.home", "");
+        if ("~".equals(trimmed)) {
+            return Path.of(home).toAbsolutePath();
+        }
+        if (trimmed.startsWith("~/")) {
+            return Path.of(home).resolve(trimmed.substring(2)).toAbsolutePath();
+        }
+        return Path.of(trimmed).toAbsolutePath();
     }
 
     public static JsonObject parseYaml(Path path) throws IOException {
@@ -105,7 +128,7 @@ public final class EnrConfigLoader {
                 continue;
             }
             String key = line.substring(0, colon).strip();
-            String value = line.substring(colon + 1).strip();
+            String value = stripComment(line.substring(colon + 1).strip());
             if (value.isEmpty()) {
                 JsonArray arr = new JsonArray();
                 current.put(key, arr);
@@ -142,6 +165,27 @@ public final class EnrConfigLoader {
         if ((value.startsWith("\"") && value.endsWith("\""))
                 || (value.startsWith("'") && value.endsWith("'"))) {
             return value.substring(1, value.length() - 1);
+        }
+        return value;
+    }
+
+    /**
+     * Removes a trailing inline comment from a scalar value. A {@code #} only
+     * starts a comment when it is preceded by whitespace, so hashes inside
+     * quoted strings or bare values survive.
+     */
+    private static String stripComment(String value) {
+        boolean inSingle = false;
+        boolean inDouble = false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\'' && !inDouble) {
+                inSingle = !inSingle;
+            } else if (c == '"' && !inSingle) {
+                inDouble = !inDouble;
+            } else if (c == '#' && !inSingle && !inDouble && (i == 0 || value.charAt(i - 1) == ' ')) {
+                return value.substring(0, i).stripTrailing();
+            }
         }
         return value;
     }

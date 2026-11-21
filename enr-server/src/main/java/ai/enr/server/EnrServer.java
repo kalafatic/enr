@@ -63,9 +63,13 @@ public final class EnrServer implements AutoCloseable {
         registerFamilyRoutes();
         if (manager != null) {
             registerManagerRoutes();
-            server.createContext("/", new WebUiHandler(manager));
+            if (manager.config().webUiEnabled() && manager.config().webUiAutoStart()) {
+                server.createContext("/", new WebUiHandler(manager));
+            } else {
+                server.createContext("/", new RootHandler(manager.config().webUiEnabled()));
+            }
         } else {
-            server.createContext("/", new RootHandler());
+            server.createContext("/", new RootHandler(false));
         }
         server.setExecutor(executor);
     }
@@ -147,6 +151,12 @@ public final class EnrServer implements AutoCloseable {
     }
 
     private static final class RootHandler implements HttpHandler {
+        private final boolean webUiEnabled;
+
+        RootHandler(boolean webUiEnabled) {
+            this.webUiEnabled = webUiEnabled;
+        }
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             JsonObject body = new JsonObject();
@@ -154,6 +164,7 @@ public final class EnrServer implements AutoCloseable {
             body.put("version", "2.6.11");
             body.put("api", "/api/v1");
             body.put("familyApi", "/enr/v1");
+            body.put("webUiEnabled", webUiEnabled);
             byte[] bytes = Json.write(body, false).getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
             exchange.sendResponseHeaders(200, bytes.length);

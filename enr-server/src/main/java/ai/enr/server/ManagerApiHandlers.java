@@ -342,8 +342,10 @@ final class ManagerApiHandlers {
                     HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'model' field");
                     return;
                 }
+                EnrManager.ChatOptions options = optionsFrom(request, stream);
+                manager.validateTools(model, options);
                 if (!stream) {
-                    JsonObject response = manager.chat(model, messages, optionsFrom(request, false));
+                    JsonObject response = manager.chat(model, messages, options);
                     HttpSupport.sendJson(exchange, response.has("error") ? 500 : 200, response);
                     return;
                 }
@@ -351,7 +353,7 @@ final class ManagerApiHandlers {
                 exchange.getResponseHeaders().set("Cache-Control", "no-cache");
                 exchange.sendResponseHeaders(200, 0);
                 try (OutputStream out = exchange.getResponseBody()) {
-                    manager.chatStream(model, messages, optionsFrom(request, true), chunk -> {
+                    manager.chatStream(model, messages, options, chunk -> {
                         try {
                             HttpSupport.sendSseEvent(out, "chunk", chunk);
                         } catch (IOException e) {
@@ -361,6 +363,8 @@ final class ManagerApiHandlers {
                 } catch (RuntimeException ignored) {
                     // client disconnected
                 }
+            } catch (EnrManager.ToolCallingUnsupportedException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
             } catch (Exception e) {
@@ -603,7 +607,7 @@ final class ManagerApiHandlers {
         }
         return new EnrManager.ChatOptions(
                 maxTokens == null ? defaults.maxTokens() : maxTokens,
-                temperature, topP, topK, seed, stop, stream);
+                temperature, topP, topK, seed, stop, stream, request.getArray("tools"));
     }
 
     private static String queryParam(HttpExchange exchange, String name, String defaultValue) {

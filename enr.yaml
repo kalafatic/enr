@@ -3,6 +3,10 @@ server:
   port: 8111
   # auth_token: ""            # optional Bearer token protecting the admin API + Web UI
 
+web_server:
+  enabled: true               # serve the Web Control Center at /
+  auto_start: true            # register the Web Control Center when the server starts
+
 runtime:
   preferred_backend: cpu      # cpu | cuda (cuda falls back to cpu unless allow_cuda_fallback: false)
   allow_cuda_fallback: true
