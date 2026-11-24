@@ -44,6 +44,7 @@ ai/enr/manager/catalog/Catalogs.class
 ai/enr/manager/provider/ProviderClient$ChatOptions.class
 ai/enr/manager/models/ollama/OllamaModelProviderFactory.class
 ai/enr/manager/provider/ProviderClient.class
+ai/enr/manager/logs/LoggingConfig.class
 ai/enr/manager/models/DownloadStatus.class
 ai/enr/manager/models/ProviderCapability.class
 ai/enr/manager/catalog/Catalogs$CatalogModel.class

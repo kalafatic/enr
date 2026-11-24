@@ -4,6 +4,7 @@
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/catalog/Catalogs.java
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/download/DownloadManager.java
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/logs/LogBuffer.java
+/home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/logs/LoggingConfig.java
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/models/DownloadJob.java
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/models/DownloadLayer.java
 /home/petr/git/enr-221126/enr-manager/src/main/java/ai/enr/manager/models/DownloadProgress.java
