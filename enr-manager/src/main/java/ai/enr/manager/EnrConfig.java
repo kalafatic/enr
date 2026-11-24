@@ -28,6 +28,7 @@ public record EnrConfig(
         String ollamaRegistryUrl,
         String ollamaSearchUrl,
         String huggingFaceApiUrl,
+        String huggingFaceToken,
         long downloadTimeoutMs,
         JsonObject modelProviders,
         boolean webUiEnabled,
@@ -59,6 +60,7 @@ public record EnrConfig(
         private String ollamaRegistryUrl = "https://registry.ollama.ai";
         private String ollamaSearchUrl = "https://ollama.com";
         private String huggingFaceApiUrl = "https://huggingface.co";
+        private String huggingFaceToken = "";
         private long downloadTimeoutMs = 0;
         private JsonObject modelProviders = new JsonObject();
         private boolean webUiEnabled = true;
@@ -149,6 +151,11 @@ public record EnrConfig(
             return this;
         }
 
+        public Builder huggingFaceToken(String token) {
+            this.huggingFaceToken = token == null ? "" : token;
+            return this;
+        }
+
         public Builder downloadTimeoutMs(long ms) {
             this.downloadTimeoutMs = ms;
             return this;
@@ -174,7 +181,7 @@ public record EnrConfig(
                     preferredBackend, allowCudaFallback, maxConcurrentSessions, defaultMaxTokens,
                     sessionIdleTimeoutSeconds, requestTimeoutSeconds, enableMetrics,
                     authToken, ollamaRegistryUrl, ollamaSearchUrl, huggingFaceApiUrl,
-                    downloadTimeoutMs, modelProviders, webUiEnabled, webUiAutoStart);
+                    huggingFaceToken, downloadTimeoutMs, modelProviders, webUiEnabled, webUiAutoStart);
         }
     }
 }

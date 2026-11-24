@@ -285,8 +285,8 @@ public final class Json {
             return pos >= text.length();
         }
 
-        IllegalArgumentException error(String message) {
-            return new IllegalArgumentException(message + " at position " + pos);
+        JsonParseException error(String message) {
+            return new JsonParseException(message + " at position " + pos);
         }
     }
 }

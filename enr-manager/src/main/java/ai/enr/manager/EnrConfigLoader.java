@@ -59,6 +59,7 @@ public final class EnrConfigLoader {
             builder.ollamaRegistryUrl(catalogs.getString("ollama_registry", "https://registry.ollama.ai"));
             builder.ollamaSearchUrl(catalogs.getString("ollama_search", "https://ollama.com"));
             builder.huggingFaceApiUrl(catalogs.getString("huggingface_api", "https://huggingface.co"));
+            builder.huggingFaceToken(resolveHfToken(catalogs.getString("huggingface_token", "")));
             builder.downloadTimeoutMs(catalogs.getLong("download_timeout_ms", 0));
         }
         JsonObject modelProviders = config.getObject("model_providers");
@@ -89,6 +90,22 @@ public final class EnrConfigLoader {
             return Path.of(home).resolve(trimmed.substring(2)).toAbsolutePath();
         }
         return Path.of(trimmed).toAbsolutePath();
+    }
+
+    /**
+     * Resolves the Hugging Face access token: an explicit config value wins,
+     * then the {@code HF_TOKEN} environment variable, then empty. The token is
+     * never logged or returned by the API.
+     */
+    private static String resolveHfToken(String configured) {
+        if (configured != null && !configured.isBlank()) {
+            return configured.strip();
+        }
+        String env = System.getenv("HF_TOKEN");
+        if (env == null) {
+            env = System.getenv("HUGGING_FACE_HUB_TOKEN");
+        }
+        return env == null || env.isBlank() ? "" : env.strip();
     }
 
     public static JsonObject parseYaml(Path path) throws IOException {

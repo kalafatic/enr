@@ -48,6 +48,7 @@ public final class DownloadManager implements AutoCloseable {
 
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
     private final Map<String, InputStream> activeBodies = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, String>> jobHeaders = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "enr-download");
         thread.setDaemon(true);
@@ -74,10 +75,24 @@ public final class DownloadManager implements AutoCloseable {
 
     public String start(String name, String url, Path targetFile, String expectedDigest,
                         Consumer<Job> onComplete) {
+        return start(name, url, targetFile, expectedDigest, Map.of(), onComplete);
+    }
+
+    /**
+     * Starts a download with optional request headers (e.g. an Authorization
+     * header for gated Hugging Face repositories). Headers are never stored on
+     * the {@link Job} and never serialized, so tokens cannot leak into logs or
+     * API responses.
+     */
+    public String start(String name, String url, Path targetFile, String expectedDigest,
+                        Map<String, String> headers, Consumer<Job> onComplete) {
         String id = UUID.randomUUID().toString();
         Job job = new Job(id, name, url, Status.RUNNING, -1, 0, expectedDigest, "",
                 targetFile.toString(), System.currentTimeMillis(), 0);
         jobs.put(id, job);
+        if (headers != null && !headers.isEmpty()) {
+            jobHeaders.put(id, Map.copyOf(headers));
+        }
         notifyChanged(job);
         executor.submit(() -> runJob(job, targetFile, onComplete));
         return id;
@@ -86,26 +101,58 @@ public final class DownloadManager implements AutoCloseable {
     private void runJob(Job job, Path targetFile, Consumer<Job> onComplete) {
         try {
             Files.createDirectories(targetFile.getParent());
-            HttpRequest request = HttpRequest.newBuilder()
+            Path partFile = Path.of(targetFile + ".part");
+            long existing = 0;
+            if (Files.exists(partFile)) {
+                try {
+                    existing = Files.size(partFile);
+                } catch (IOException ignored) {
+                    existing = 0;
+                }
+            }
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(job.url()))
                     .GET()
-                    .header("User-Agent", "enr/2.6")
-                    .build();
-            Path partFile = Path.of(targetFile + ".part");
-            HttpResponse<InputStream> response = http.send(request,
+                    .header("User-Agent", "enr/2.6");
+            Map<String, String> headers = jobHeaders.get(job.id());
+            if (headers != null) {
+                headers.forEach(builder::header);
+            }
+            if (existing > 0) {
+                builder.header("Range", "bytes=" + existing + "-");
+            }
+            HttpResponse<InputStream> response = http.send(builder.build(),
                     HttpResponse.BodyHandlers.ofInputStream());
-            if (response.statusCode() != 200) {
-                fail(job, "HTTP " + response.statusCode());
+            int status = response.statusCode();
+            boolean resuming;
+            if (status == 206 && existing > 0) {
+                resuming = true;
+            } else if (status == 200) {
+                resuming = false;
+                existing = 0;
+            } else if (status == 416) {
+                // Range not satisfiable: the partial file is already complete.
+                verifyAndFinish(job, partFile, targetFile, existing, onComplete);
+                return;
+            } else {
+                fail(job, "HTTP " + status);
                 return;
             }
-            long total = response.headers().firstValueAsLong("Content-Length").orElse(-1);
-            if (total >= 0) {
-                update(job, total, 0, Status.RUNNING, "");
-            }
-            AtomicLong completed = new AtomicLong();
+            long remaining = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+            long total = remaining >= 0 ? existing + remaining : -1;
+            update(job, total, existing, Status.RUNNING, "");
+            AtomicLong completed = new AtomicLong(existing);
             long[] lastFlush = {System.currentTimeMillis()};
             try (InputStream in = response.body();
-                 OutputStream out = Files.newOutputStream(partFile)) {
+                 OutputStream out = Files.newOutputStream(partFile, resuming
+                         ? new java.nio.file.OpenOption[]{
+                                 java.nio.file.StandardOpenOption.CREATE,
+                                 java.nio.file.StandardOpenOption.WRITE,
+                                 java.nio.file.StandardOpenOption.APPEND}
+                         : new java.nio.file.OpenOption[]{
+                                 java.nio.file.StandardOpenOption.CREATE,
+                                 java.nio.file.StandardOpenOption.WRITE,
+                                 java.nio.file.StandardOpenOption.TRUNCATE_EXISTING})) {
                 activeBodies.put(job.id(), in);
                 byte[] buffer = new byte[64 * 1024];
                 int read;
@@ -129,8 +176,25 @@ public final class DownloadManager implements AutoCloseable {
                 update(job, total, completed.get(), Status.CANCELLED, "cancelled by user");
                 return;
             }
+            verifyAndFinish(job, partFile, targetFile, completed.get(), onComplete);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            update(job, job.totalBytes(), job.completedBytes(), Status.CANCELLED, "interrupted");
+        } catch (IOException e) {
+            if (isCancelled(job)) {
+                update(job, job.totalBytes(), job.completedBytes(), Status.CANCELLED, "cancelled by user");
+            } else {
+                // Keep the .part file so a retry can resume via HTTP Range.
+                fail(job, e.getMessage());
+            }
+        }
+    }
+
+    private void verifyAndFinish(Job job, Path partFile, Path targetFile, long completed,
+                                 Consumer<Job> onComplete) {
+        try {
             if (job.digest() != null && !job.digest().isBlank()) {
-                update(job, total, completed.get(), Status.VERIFYING, "");
+                update(job, completed, completed, Status.VERIFYING, "");
                 String actual = ai.enr.core.io.Hashing.sha256Hex(Files.readAllBytes(partFile));
                 if (!job.digest().equals(actual)) {
                     Files.deleteIfExists(partFile);
@@ -144,15 +208,8 @@ public final class DownloadManager implements AutoCloseable {
             if (onComplete != null) {
                 onComplete.accept(done);
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            update(job, job.totalBytes(), job.completedBytes(), Status.CANCELLED, "interrupted");
         } catch (IOException e) {
-            if (isCancelled(job)) {
-                update(job, job.totalBytes(), job.completedBytes(), Status.CANCELLED, "cancelled by user");
-            } else {
-                fail(job, e.getMessage());
-            }
+            fail(job, e.getMessage());
         }
     }
 

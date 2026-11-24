@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.logging.FileHandler;
@@ -298,6 +299,24 @@ public final class EnrManager implements AutoCloseable {
         return modelDetails(manifest.id());
     }
 
+    /**
+     * Copies an installed local model under a new identifier (Ollama
+     * {@code /api/copy}). The artifact is duplicated and a fresh manifest is
+     * written; the source model is left untouched.
+     */
+    public void copyModel(String source, String destination) throws IOException {
+        ModelStore.StoredModel src = store.find(source);
+        if (src == null) {
+            throw new IllegalArgumentException("Model not installed: " + source);
+        }
+        Path file = src.manifest().modelFile();
+        if (file == null || !Files.isRegularFile(file)) {
+            throw new IllegalArgumentException("Source model artifact is missing: " + source);
+        }
+        store.importModel(file, destination);
+        log.info("enr", "Copied model " + source + " -> " + destination);
+    }
+
     public JsonObject verifyModel(String id) {
         boolean ok = store.verify(id);
         log.info("enr", "Verification for " + id + ": " + (ok ? "OK" : "FAILED"));
@@ -315,7 +334,14 @@ public final class EnrManager implements AutoCloseable {
         String targetFile = targetDir.resolve(name + ".gguf").toString();
         log.info("enr", "Pull requested: " + ref + " -> " + resolved.url()
                 + (resolved.digest().isBlank() ? " (no digest)" : " (digest " + resolved.digest() + ")"));
-        return downloads.start(resolved.name(), resolved.url(), Path.of(targetFile), resolved.digest(), job -> {
+        Map<String, String> headers = Map.of();
+        if (!config.huggingFaceToken().isBlank()
+                && resolved.url().startsWith(stripSlash(config.huggingFaceApiUrl()))) {
+            headers = Map.of("Authorization", "Bearer " + config.huggingFaceToken());
+        }
+        Map<String, String> finalHeaders = headers;
+        return downloads.start(resolved.name(), resolved.url(), Path.of(targetFile), resolved.digest(),
+                finalHeaders, job -> {
             try {
                 store.registerDownload(name, Path.of(job.targetFile()), job.digest(),
                         job.totalBytes(), "catalog:" + resolved.name());
@@ -326,22 +352,72 @@ public final class EnrManager implements AutoCloseable {
         });
     }
 
+    private static String stripSlash(String url) {
+        return url == null ? "" : url.replaceAll("/+$", "");
+    }
+
+    /**
+     * Ensures a model reference is downloaded and registered, returning its
+     * local id. When the model is already installed it returns immediately
+     * without downloading; otherwise it starts a pull and returns the download
+     * job id for progress monitoring.
+     */
+    public JsonObject ensureAvailable(String ref) throws IOException {
+        String name = ModelStore.sanitizeId(modelName(ref));
+        // A reference that already matches an installed model id (exact or
+        // derived) must not be re-resolved or re-downloaded.
+        ModelStore.StoredModel installed = store.find(ref);
+        if (installed == null) {
+            installed = store.find(name);
+        }
+        if (installed != null) {
+            JsonObject response = new JsonObject();
+            response.put("id", installed.id());
+            response.put("installed", true);
+            response.put("download_id", "");
+            return response;
+        }
+        String jobId = pullModel(ref);
+        JsonObject response = new JsonObject();
+        response.put("id", name);
+        response.put("installed", false);
+        response.put("download_id", jobId);
+        return response;
+    }
+
     private static String modelName(String ref) {
-        String name = ref.startsWith("hf:") ? ref.substring(3) : ref;
-        if (!ref.startsWith("hf:") && name.startsWith("ollama:")) {
+        String name = ref;
+        boolean hf = false;
+        if (name.startsWith("hf:")) {
+            name = name.substring(3);
+            hf = true;
+        } else if (name.startsWith("hf.co/") || name.startsWith("huggingface.co/")) {
+            name = name.substring(name.indexOf('/') + 1);
+            hf = true;
+        } else if (name.startsWith("ollama:")) {
             name = name.substring("ollama:".length());
         }
+        name = name.strip();
+        if (hf) {
+            int colon = name.lastIndexOf(':');
+            String quant = "";
+            String path = name;
+            if (colon > 0 && name.indexOf('/', colon) < 0) {
+                quant = name.substring(colon + 1);
+                path = name.substring(0, colon);
+            }
+            String basename = path.substring(path.lastIndexOf('/') + 1);
+            basename = basename.replaceAll("(?i)-gguf$", "");
+            basename = basename.replaceAll("(?i)\\.gguf$", "");
+            return quant.isBlank() ? basename : basename + ":" + quant;
+        }
         int colon = name.lastIndexOf(':');
-        if (colon > 0 && name.indexOf('/') < 0) {
+        if (colon > 0) {
             name = name.substring(0, colon);
         }
         int slash = name.lastIndexOf('/');
         if (slash >= 0) {
             name = name.substring(slash + 1);
-        }
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            name = name.substring(0, dot);
         }
         return name;
     }
@@ -440,10 +516,21 @@ public final class EnrManager implements AutoCloseable {
         long started = System.currentTimeMillis();
         validateTools(modelName, options);
         ModelRouter.Route route = router.resolve(modelName);
+        logRequest(modelName, route, messages, options);
         if (route.target() == ModelRouter.Route.Target.LOCAL) {
             return chatLocal(route.modelId(), messages, options, started);
         }
         return chatProvider(route, messages, options, started, null);
+    }
+
+    private void logRequest(String modelName, ModelRouter.Route route,
+                            List<ChatMessage> messages, ChatOptions options) {
+        log.info("chat", "request model=" + modelName
+                + " target=" + route.target().name().toLowerCase()
+                + (route.provider() != null ? " provider=" + route.provider().id() : "")
+                + " messages=" + messages.size()
+                + " tools=" + (options.tools() == null ? 0 : options.tools().size())
+                + " stream=" + options.stream());
     }
 
     /** Streams chat output; final chunk has done=true. */
@@ -452,6 +539,7 @@ public final class EnrManager implements AutoCloseable {
         long started = System.currentTimeMillis();
         validateTools(modelName, options);
         ModelRouter.Route route = router.resolve(modelName);
+        logRequest(modelName, route, messages, options);
         if (route.target() == ModelRouter.Route.Target.LOCAL) {
             chatLocalStream(route.modelId(), messages, options, started, onChunk);
         } else {
@@ -559,6 +647,7 @@ public final class EnrManager implements AutoCloseable {
         response.put("elapsed_ms", System.currentTimeMillis() - started);
         if (!result.ok()) {
             response.put("error", result.error());
+            response.put("error_status", result.status());
         }
         return response;
     }

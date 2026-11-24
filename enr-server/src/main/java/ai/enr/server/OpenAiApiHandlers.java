@@ -3,6 +3,7 @@ package ai.enr.server;
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
+import ai.enr.core.json.JsonParseException;
 import ai.enr.core.json.JsonValue;
 import ai.enr.manager.EnrManager;
 import ai.enr.manager.provider.ChatMessage;
@@ -71,7 +72,7 @@ final class OpenAiApiHandlers {
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
                     if (result.has("error")) {
-                        HttpSupport.sendError(exchange, 500, "INFERENCE_FAILED",
+                        HttpSupport.sendError(exchange, errorStatus(result), "INFERENCE_FAILED",
                                 result.getString("error", "inference failed"));
                         return;
                     }
@@ -144,6 +145,8 @@ final class OpenAiApiHandlers {
                 }
             } catch (EnrManager.ToolCallingUnsupportedException e) {
                 HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
+            } catch (JsonParseException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
             } catch (Exception e) {
@@ -170,7 +173,7 @@ final class OpenAiApiHandlers {
                 JsonObject result = manager.chat(model, messages,
                         chatOptionsFrom(request, false));
                 if (result.has("error")) {
-                    HttpSupport.sendError(exchange, 500, "INFERENCE_FAILED",
+                    HttpSupport.sendError(exchange, errorStatus(result), "INFERENCE_FAILED",
                             result.getString("error", "inference failed"));
                     return;
                 }
@@ -193,6 +196,8 @@ final class OpenAiApiHandlers {
                         + result.getInt("completion_tokens", 0));
                 response.put("usage", usage);
                 HttpSupport.sendJson(exchange, 200, response);
+            } catch (JsonParseException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
             } catch (Exception e) {
@@ -212,9 +217,9 @@ final class OpenAiApiHandlers {
                 HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
                 return;
             }
-            JsonObject request = HttpSupport.parseBodyObject(exchange);
-            String model = request.getString("model", "");
             try {
+                JsonObject request = HttpSupport.parseBodyObject(exchange);
+                String model = request.getString("model", "");
                 ModelRouter.Route route = manager.router().resolve(model);
                 if (route.target() == ModelRouter.Route.Target.LOCAL) {
                     HttpSupport.sendError(exchange, 501, "UNSUPPORTED",
@@ -248,6 +253,8 @@ final class OpenAiApiHandlers {
                 try (OutputStream out = exchange.getResponseBody()) {
                     out.write(bytes);
                 }
+            } catch (JsonParseException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
             } catch (Exception e) {
@@ -372,5 +379,10 @@ final class OpenAiApiHandlers {
         return new EnrManager.ChatOptions(
                 maxTokens == null ? defaults.maxTokens() : maxTokens,
                 temperature, topP, topK, seed, stop, stream, request.getArray("tools"));
+    }
+
+    /** Client-facing status for a chat failure, honoring a propagated provider status. */
+    private static int errorStatus(JsonObject result) {
+        return result.has("error_status") ? result.getInt("error_status", 502) : 502;
     }
 }

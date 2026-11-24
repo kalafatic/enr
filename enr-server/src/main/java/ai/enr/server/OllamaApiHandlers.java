@@ -3,9 +3,14 @@ package ai.enr.server;
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
+import ai.enr.core.json.JsonParseException;
 import ai.enr.core.json.JsonValue;
 import ai.enr.manager.EnrManager;
 import ai.enr.manager.provider.ChatMessage;
+import ai.enr.manager.provider.Provider;
+import ai.enr.manager.provider.ProviderClient;
+import ai.enr.manager.provider.ProviderType;
+import ai.enr.manager.router.ModelRouter;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
@@ -51,6 +56,8 @@ final class OllamaApiHandlers {
                     name = request.getString("model", "");
                 }
                 HttpSupport.sendJson(exchange, 200, manager.ollamaShow(name));
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendOllamaError(exchange, 404, e.getMessage());
             }
@@ -198,6 +205,8 @@ final class OllamaApiHandlers {
                 manager.removeModel(name);
                 exchange.sendResponseHeaders(200, -1);
                 exchange.close();
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
@@ -226,7 +235,7 @@ final class OllamaApiHandlers {
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
                     if (result.has("error")) {
-                        sendOllamaError(exchange, 500, result.getString("error", "inference failed"));
+                        sendOllamaError(exchange, errorStatus(result), result.getString("error", "inference failed"));
                         return;
                     }
                     JsonObject response = new JsonObject();
@@ -291,6 +300,8 @@ final class OllamaApiHandlers {
                 }
             } catch (EnrManager.ToolCallingUnsupportedException e) {
                 sendOllamaError(exchange, 400, e.getMessage());
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
@@ -319,7 +330,7 @@ final class OllamaApiHandlers {
                 if (!stream) {
                     JsonObject result = manager.chat(model, messages, options);
                     if (result.has("error")) {
-                        sendOllamaError(exchange, 500, result.getString("error", "inference failed"));
+                        sendOllamaError(exchange, errorStatus(result), result.getString("error", "inference failed"));
                         return;
                     }
                     JsonObject response = new JsonObject();
@@ -360,6 +371,8 @@ final class OllamaApiHandlers {
                 }
             } catch (EnrManager.ToolCallingUnsupportedException e) {
                 sendOllamaError(exchange, 400, e.getMessage());
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendOllamaError(exchange, 404, e.getMessage());
             } catch (Exception e) {
@@ -385,6 +398,105 @@ final class OllamaApiHandlers {
                 return;
             }
             HttpSupport.sendJson(exchange, 200, manager.version());
+        };
+    }
+
+    static HttpHandler copy(EnrManager manager) {
+        return exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendOllamaError(exchange, 405, "Only POST allowed");
+                return;
+            }
+            try {
+                JsonObject request = HttpSupport.parseBodyObject(exchange);
+                String source = request.getString("source", "");
+                String destination = request.getString("destination", "");
+                if (source.isBlank()) {
+                    sendOllamaError(exchange, 400, "Missing 'source' field");
+                    return;
+                }
+                if (destination.isBlank()) {
+                    sendOllamaError(exchange, 400, "Missing 'destination' field");
+                    return;
+                }
+                manager.copyModel(source, destination);
+                exchange.sendResponseHeaders(200, -1);
+                exchange.close();
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
+            } catch (IllegalArgumentException e) {
+                sendOllamaError(exchange, 404, e.getMessage());
+            } catch (IllegalStateException e) {
+                sendOllamaError(exchange, 409, e.getMessage());
+            } catch (Exception e) {
+                sendOllamaError(exchange, 500, e.getMessage());
+            }
+        };
+    }
+
+    static HttpHandler embed(EnrManager manager) {
+        return exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendOllamaError(exchange, 405, "Only POST allowed");
+                return;
+            }
+            try {
+                JsonObject request = HttpSupport.parseBodyObject(exchange);
+                String model = request.getString("model", "");
+                if (model.isBlank()) {
+                    sendOllamaError(exchange, 400, "Missing 'model' field");
+                    return;
+                }
+                ModelRouter.Route route = manager.router().resolve(model);
+                if (route.target() == ModelRouter.Route.Target.LOCAL) {
+                    sendOllamaError(exchange, 501,
+                            "Embeddings are not supported for local ENR models "
+                                    + "(the native runtime exposes logits only)");
+                    return;
+                }
+                Provider provider = route.provider();
+                if (provider.type() != ProviderType.DEEPSEEK
+                        && provider.type() != ProviderType.OPENAI
+                        && provider.type() != ProviderType.OPENAI_COMPAT) {
+                    sendOllamaError(exchange, 501,
+                            "Provider '" + provider.id() + "' (" + provider.type().id()
+                                    + ") does not support embeddings");
+                    return;
+                }
+                JsonObject forwarded = new JsonObject();
+                forwarded.put("model", route.modelId());
+                forwarded.put("input", request.get("input"));
+                byte[] body;
+                try (ProviderClient client = new ProviderClient()) {
+                    body = client.embeddings(provider, forwarded);
+                }
+                if (body == null) {
+                    sendOllamaError(exchange, 502, "Provider rejected the embeddings request");
+                    return;
+                }
+                JsonObject openAi = Json.parseObject(new String(body, StandardCharsets.UTF_8));
+                JsonObject response = new JsonObject();
+                response.put("model", model);
+                JsonArray embeddings = new JsonArray();
+                JsonArray data = openAi.getArray("data");
+                if (data != null) {
+                    for (int i = 0; i < data.size(); i++) {
+                        JsonObject item = data.getObject(i);
+                        JsonValue embedding = item == null ? null : item.get("embedding");
+                        embeddings.add(embedding == null ? new JsonArray() : embedding);
+                    }
+                }
+                response.put("embeddings", embeddings);
+                JsonObject usage = openAi.getObject("usage");
+                response.put("prompt_eval_count", usage == null ? 0 : usage.getInt("prompt_tokens", 0));
+                HttpSupport.sendJson(exchange, 200, response);
+            } catch (JsonParseException e) {
+                sendOllamaError(exchange, 400, e.getMessage());
+            } catch (IllegalArgumentException e) {
+                sendOllamaError(exchange, 404, e.getMessage());
+            } catch (Exception e) {
+                sendOllamaError(exchange, 500, e.getMessage());
+            }
         };
     }
 
@@ -543,5 +655,10 @@ final class OllamaApiHandlers {
         JsonObject body = new JsonObject();
         body.put("error", message == null ? "unknown error" : message);
         HttpSupport.sendJson(exchange, status, body);
+    }
+
+    /** Client-facing status for a chat/generate failure, honoring a propagated provider status. */
+    private static int errorStatus(JsonObject result) {
+        return result.has("error_status") ? result.getInt("error_status", 502) : 502;
     }
 }

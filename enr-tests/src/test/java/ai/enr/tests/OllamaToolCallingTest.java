@@ -128,6 +128,30 @@ class OllamaToolCallingTest extends ManagerTestBase {
                 instanceof ai.enr.core.json.JsonString);
     }
 
+    @Test
+    void chatMalformedJsonReturns400() throws Exception {
+        HttpResponse<String> response = post("/api/chat", "not json");
+        assertEquals(400, response.statusCode(), response.body());
+        assertTrue(Json.parseObject(response.body()).get("error")
+                instanceof ai.enr.core.json.JsonString);
+    }
+
+    @Test
+    void generateMalformedJsonReturns400() throws Exception {
+        HttpResponse<String> response = post("/api/generate", "not json");
+        assertEquals(400, response.statusCode(), response.body());
+        assertTrue(Json.parseObject(response.body()).get("error")
+                instanceof ai.enr.core.json.JsonString);
+    }
+
+    @Test
+    void openAiChatMalformedJsonReturns400() throws Exception {
+        HttpResponse<String> response = post("/v1/chat/completions", "not json");
+        assertEquals(400, response.statusCode(), response.body());
+        JsonObject body = Json.parseObject(response.body());
+        assertEquals("INVALID_REQUEST", body.getObject("error").getString("code", ""));
+    }
+
     // ------------------------------------------------------------ local tools rejected
 
     @Test

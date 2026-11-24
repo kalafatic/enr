@@ -74,7 +74,9 @@ public final class Catalogs implements AutoCloseable {
     /**
      * Resolves a pull reference to a concrete artifact URL + digest.
      * Forms: {@code ollama:NAME[:TAG]} or plain {@code NAME[:TAG]} for the
-     * Ollama Library, and {@code hf:REPO/FILE.gguf} for Hugging Face.
+     * Ollama Library; {@code hf:OWNER/REPO:QUANT} (quantization discovery) and
+     * {@code hf:OWNER/REPO/FILE.gguf} (explicit file) for Hugging Face. The
+     * {@code hf.co/} and {@code huggingface.co/} prefixes are also accepted.
      */
     public ResolvedDownload resolveDownload(String ref) throws IOException {
         if (ref == null || ref.isBlank()) {
@@ -83,13 +85,16 @@ public final class Catalogs implements AutoCloseable {
         if (ref.startsWith("hf:")) {
             return resolveHuggingFace(ref.substring(3).strip());
         }
+        if (ref.startsWith("hf.co/") || ref.startsWith("huggingface.co/")) {
+            return resolveHuggingFace(ref.substring(ref.indexOf('/') + 1).strip());
+        }
         String name = ref;
         if (name.startsWith("ollama:")) {
             name = name.substring("ollama:".length()).strip();
         }
         if (name.contains("/") && !name.startsWith("library/")) {
             throw new IllegalArgumentException("Invalid Ollama model reference '" + ref
-                    + "'; use NAME[:TAG] (e.g. 'llama3.2:1b') or hf:REPO/FILE.gguf for Hugging Face");
+                    + "'; use NAME[:TAG] (e.g. 'llama3.2:1b') or hf:OWNER/REPO:QUANT for Hugging Face");
         }
         return resolveOllama(name);
     }
@@ -212,12 +217,72 @@ public final class Catalogs implements AutoCloseable {
     }
 
     private ResolvedDownload resolveHuggingFace(String ref) throws IOException {
-        int slash = ref.indexOf('/');
-        if (slash <= 0) {
-            throw new IllegalArgumentException("Hugging Face reference must be REPO/FILE.gguf: " + ref);
+        // Accepted forms after the hf: prefix is stripped:
+        //   OWNER/REPO:QUANT            -> discover the GGUF for QUANT
+        //   OWNER/REPO/FILE.gguf        -> explicit file (subdirs allowed)
+        int colon = ref.lastIndexOf(':');
+        if (colon > 0 && ref.indexOf('/', colon) < 0) {
+            String repo = ref.substring(0, colon);
+            String quant = ref.substring(colon + 1);
+            return resolveHuggingFaceQuant(repo, quant);
         }
-        String repo = ref.substring(0, slash);
-        String filePath = ref.substring(slash + 1);
+        String[] parts = ref.split("/");
+        if (parts.length < 3) {
+            throw new IllegalArgumentException("Hugging Face reference must be OWNER/REPO:QUANT "
+                    + "or OWNER/REPO/FILE.gguf, got: " + ref);
+        }
+        String repo = parts[0] + "/" + parts[1];
+        String filePath = String.join("/", java.util.Arrays.copyOfRange(parts, 2, parts.length));
+        return resolveHuggingFaceFile(repo, filePath);
+    }
+
+    /**
+     * Discovers the GGUF file for a quantization tag within a repository. A
+     * requested quantization must resolve to exactly one file; ambiguity or
+     * absence produces a clear error listing the available options.
+     */
+    private ResolvedDownload resolveHuggingFaceQuant(String repo, String quant) throws IOException {
+        if (quant == null || quant.isBlank()) {
+            throw new IllegalArgumentException("Missing quantization tag for Hugging Face repo '" + repo
+                    + "' (use OWNER/REPO:QUANT)");
+        }
+        List<JsonObject> ggufs = listGgufFiles(repo);
+        if (ggufs.isEmpty()) {
+            throw new IOException("No GGUF files found in Hugging Face repo '" + repo + "'");
+        }
+        List<JsonObject> matches = new ArrayList<>();
+        for (JsonObject f : ggufs) {
+            if (matchesQuant(f.getString("path", ""), quant)) {
+                matches.add(f);
+            }
+        }
+        if (matches.isEmpty()) {
+            List<String> available = new ArrayList<>();
+            for (JsonObject f : ggufs) {
+                available.add(quantOf(f.getString("path", "")));
+            }
+            throw new IOException("Quantization '" + quant + "' not found in repo '" + repo
+                    + "'. Available: " + String.join(", ", available));
+        }
+        if (matches.size() > 1) {
+            List<String> files = new ArrayList<>();
+            for (JsonObject f : matches) {
+                files.add(f.getString("path", ""));
+            }
+            throw new IOException("Quantization '" + quant + "' is ambiguous in repo '" + repo
+                    + "'; matches: " + String.join(", ", files));
+        }
+        JsonObject file = matches.get(0);
+        String path = file.getString("path", "");
+        String base = stripTrailingSlash(config.huggingFaceApiUrl());
+        String downloadUrl = base + "/" + repo + "/resolve/main/" + path;
+        JsonObject lfs = file.getObject("lfs");
+        String digest = lfs == null ? "" : lfs.getString("oid", "");
+        long size = lfs == null ? file.getLong("size", 0) : lfs.getLong("size", file.getLong("size", 0));
+        return new ResolvedDownload(repo + ":" + quant, downloadUrl, digest, size);
+    }
+
+    private ResolvedDownload resolveHuggingFaceFile(String repo, String filePath) throws IOException {
         String base = stripTrailingSlash(config.huggingFaceApiUrl());
         String treeUrl = base + "/api/models/" + repo + "/tree/main/"
                 + URLEncoder.encode(filePath, StandardCharsets.UTF_8);
@@ -242,6 +307,59 @@ public final class Catalogs implements AutoCloseable {
         return new ResolvedDownload(repo + "/" + filePath, downloadUrl, digest, size);
     }
 
+    /** Lists the GGUF files at the root of a repository via the HF tree API. */
+    private List<JsonObject> listGgufFiles(String repo) throws IOException {
+        String base = stripTrailingSlash(config.huggingFaceApiUrl());
+        String treeUrl = base + "/api/models/" + repo + "/tree/main";
+        JsonValue parsed = fetchJson(treeUrl);
+        List<JsonObject> files = new ArrayList<>();
+        if (parsed instanceof JsonArray arr) {
+            for (int i = 0; i < arr.size(); i++) {
+                JsonObject entry = arr.getObject(i);
+                if (entry == null) {
+                    continue;
+                }
+                String type = entry.getString("type", "");
+                String path = entry.getString("path", "");
+                if ("file".equals(type) && path != null && path.toLowerCase().endsWith(".gguf")
+                        && !path.toLowerCase().contains("mmproj")) {
+                    files.add(entry);
+                }
+            }
+        }
+        return files;
+    }
+
+    /** Whether a GGUF file path carries the requested quantization tag. */
+    public static boolean matchesQuant(String path, String quant) {
+        if (path == null || quant == null) {
+            return false;
+        }
+        String base = path.toLowerCase();
+        if (base.endsWith(".gguf")) {
+            base = base.substring(0, base.length() - ".gguf".length());
+        }
+        String t = quant.toLowerCase().strip();
+        if (t.isEmpty()) {
+            return false;
+        }
+        return base.equals(t) || base.endsWith("-" + t) || base.endsWith("_" + t)
+                || base.contains("-" + t + "-") || base.contains("-" + t + ".");
+    }
+
+    /** Extracts a display quantization from a GGUF file name for error messages. */
+    private static String quantOf(String path) {
+        String base = path == null ? "" : path;
+        int slash = base.lastIndexOf('/');
+        if (slash >= 0) {
+            base = base.substring(slash + 1);
+        }
+        if (base.toLowerCase().endsWith(".gguf")) {
+            base = base.substring(0, base.length() - 5);
+        }
+        return base;
+    }
+
     // ---------------------------------------------------------------- shared
 
     private JsonValue fetchJson(String url) throws IOException {
@@ -250,12 +368,16 @@ public final class Catalogs implements AutoCloseable {
 
     private String fetchString(String url) throws IOException {
         try {
-            HttpResponse<String> response = http.send(HttpRequest.newBuilder()
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .header("User-Agent", "enr/2.6")
                     .header("Accept", "application/json")
-                    .GET()
-                    .build(), HttpResponse.BodyHandlers.ofString());
+                    .GET();
+            String token = config.huggingFaceToken();
+            if (!token.isBlank() && url.startsWith(stripTrailingSlash(config.huggingFaceApiUrl()))) {
+                builder.header("Authorization", "Bearer " + token);
+            }
+            HttpResponse<String> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) {
                 throw new IOException("HTTP " + response.statusCode() + " for " + url);
             }

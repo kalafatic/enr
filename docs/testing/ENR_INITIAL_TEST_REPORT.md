@@ -1,339 +1,322 @@
 # ENR Initial Test Report
 
-Initial functional testing and stabilization iteration for ENR (EVO Native Runtime).
-Iteration date: 2026-11-21.
-Primary agent: OpenCode with cloud DeepSeek (`deepseek/deepseek-v4-pro`, confirmed in
-`~/.local/share/opencode/log/opencode.log`: `providerID=deepseek modelID=deepseek-v4-pro`).
-No local Ollama model was used as the agent.
+Initial functional testing, integration verification, defect correction and stabilization iteration for ENR (EVO Native Runtime).
+
+- Iteration date: 2026-11-23.
+- Primary agent: OpenCode with cloud DeepSeek (`deepseek/deepseek-v4-pro`), confirmed by the harness model identity and `~/.config/opencode/opencode.jsonc` (`deepseek` provider → `deepseek-v4-pro`).
+- No local Ollama model was used as the primary agent. Local ENR-native inference was tested through ENR itself.
+
+> This report records a **new iteration** against the relocated repository
+> `/home/petr/git/enr-221126` (remote `github.com/kalafatic/enr`). A prior iteration
+> (2026-11-21) ran against the former path `/home/petr/git/evo-native-runtime-161126`;
+> its fixes are already present in this repository's source and are re-verified here.
+> The original 2026-11-21 baseline is retained in the git history of this repository.
 
 ## 1. Environment
 
 | Item | Value |
 | --- | --- |
-| ENR repository | `/home/petr/git/evo-native-runtime-161126` (remote: github.com/kalafatic/evo-native-runtime) |
+| ENR repository | `/home/petr/git/enr-221126` (remote: github.com/kalafatic/enr), branch `master`, clean tree at start |
 | ENR version | 2.6.11-SNAPSHOT |
 | ENR endpoint | `http://127.0.0.1:8111` (enr.yaml) |
-| ENR start | `./enr.sh serve -c enr.yaml` (shaded CLI jar, JDK 25 preferred, JDK 21 CPU fallback) |
-| ENR stop | SIGTERM / SIGINT — graceful "Shutting down ENR (unloading models)..." |
+| ENR start/stop | `./enr.sh serve -c enr.yaml` (shaded CLI jar); SIGTERM for graceful shutdown |
 | Build | `JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 mvn package` — 13 modules, `release=21` |
-| Existing tests | 88 tests, 0 failures (baseline) |
-| OpenCode | 1.19.6 |
-| OpenCode agent model | `deepseek/deepseek-v4-pro` (cloud, api.deepseek.com) |
-| OpenCode config | `~/.config/opencode/opencode.jsonc` (default model `ollama/qwen3-coder-30b-32k:latest` for other sessions) |
+| Java | JDK 21 (`21.0.13.1`) and JDK 25 (`25.0.5.1`) installed; default `java` is 1.8 (unused) |
+| Maven | 3.8.7 |
+| Hardware | 64 vCPU, 121 GiB RAM, NVIDIA RTX 5070 Ti (16 GB, driver 595.99.02) |
+| OpenCode | v2.4.0 (`/home/petr/.opencode/bin/opencode`) |
+| OpenCode agent model | `deepseek/deepseek-v4-pro` (cloud) — this agent |
 | Real Ollama (reference) | 0.40.16 at `http://127.0.0.1:11434` |
-| ENR local models | `evo`, `tiny-evo` (GGUF, from `enr-model-loader/src/test/resources/models`) |
-| ENR providers | none configured (`~/.enr/state.json` absent, `/api/v1/providers` = `[]`) |
+| ENR local models | `evo` (53952 params, ctx 4), `tiny-evo` (920 params, ctx 32) — GGUF, CPU backend |
 | ENR data dir | `~/.enr` (models, logs, provider registry) |
-
-Uncommitted changes were present before this iteration (web_server config in EnrConfig/EnrConfigLoader/
-EnrManager/EnrServer + enr.yaml). They were treated as pre-existing baseline and were rebuilt as-is.
+| Audit storage | `/home/petr/.evo/audit/` (evo-audit engine, `/home/petr/git/evo-audit-221126`) |
 
 ## 2. Architecture observations
 
-- `enr-server` (JDK `com.sun.net.httpserver`, no external deps) exposes:
-  - Ollama-compatible: `/api/tags`, `/api/show`, `/api/pull`, `/api/delete`, `/api/chat`, `/api/generate`, `/api/ps`, `/api/version` (`OllamaApiHandlers`)
-  - OpenAI-compatible: `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings` (`OpenAiApiHandlers`)
-  - Native `/api/v1/*`, family `/enr/v1/*`, Web UI at `/`
+- `enr-server` (JDK `com.sun.net.httpserver`, virtual threads, zero external deps) exposes:
+  - Native `/api/v1/*` (`health/status/models/models/load|unload/inference/inference/stream/inference/cancel/sessions/metrics/devices`).
+  - Family `/enr/v1/*` (`health/models/chat/chat/stream/runtime/providers/capabilities`).
+  - Ollama-compatible `/api/*` (`version/tags/show/pull/delete/chat/generate/ps`).
+  - OpenAI-compatible `/v1/*` (`models/chat/completions/completions/embeddings`).
+  - Management REST `/api/v1/{catalog,models,providers,downloads,chat,dashboard,diagnostics,logs,hardware}`.
+  - Web Control Center at `/`.
 - `EnrManager` is the single facade: routing (`ModelRouter`) → local (`EnrRuntime`) or provider (`ProviderClient`).
-- `ProviderClient` supports OpenAI-compatible (DeepSeek/OpenAI/Ollama /v1/llama.cpp), Anthropic, Gemini.
-- `ChatMessage(role, content)` carries text only; **no tool/tool_calls support anywhere** (confirmed by grep).
-- Local native inference is text-only (prompt flattening in `EnrManager.buildPrompt`); toy models (`tiny-evo` 920 params, ctx 32).
-- OpenCode's built-in Ollama provider (opencode 1.19.6, `packages/core/src/plugin/provider/ollama.ts`) discovers models via
-  native `/api/tags` + `/api/show` and **requires `/api/show` to return `capabilities: ["completion"]`**;
-  `/api/show` is called with `{"model": ...}` (not `name`); context is read from `model_info.<something>.context_length`;
-  tool calling is enabled per model only when `capabilities` includes `"tools"`; execution uses the
-  OpenAI-compatible runtime against `<baseURL>/v1/chat/completions`.
+- `ProviderClient` supports OpenAI-compatible (DeepSeek/OpenAI/Ollama `/v1`/llama.cpp), Anthropic, Gemini; tool calling is relayed only for OpenAI-compatible routes and rejected explicitly (400) elsewhere.
+- Local native inference is a real transformer forward pass (CPU/CUDA) over `.evo`/GGUF models; the bundled `evo`/`tiny-evo` are synthetic fixtures with vocabularies of literal `token_N` strings, so their decoded output is deterministic but not meaningful text.
+- `ChatMessage` carries text plus optional tool-call/reasoning payload; tool calling is fully wired for OpenAI-compatible provider routes.
 
-## 3. Initial Baseline (before modifications)
+## 3. Initial Baseline (before this iteration's modifications)
 
-Legend: PASS / FAIL / BLOCKED / NOT TESTED.
+Legend: PASS / PARTIAL / FAIL / BLOCKED / NOT TESTED.
 
-### B1. Ollama protocol (ENR @ 127.0.0.1:8111)
+Baseline build: `mvn clean package` — **BUILD SUCCESS**. Automated tests: **156 tests, 0 failures** (all modules; `enr-tests` = 106).
 
-| # | Scenario | Result | Evidence |
+| # | Area | Result | Evidence |
 | --- | --- | --- | --- |
-| B1.1 | GET `/api/version` | PASS | `{"version":"2.6.11","name":"ENR"}` (real Ollama: `{"version":"0.40.16"}` — extra `name` field is a compatible superset) |
-| B1.2 | GET `/api/tags` | PASS (partial) | `evo`, `tiny-evo` listed with name/model/modified_at/size/digest/details. Missing per-model `capabilities` present in real Ollama 0.40 |
-| B1.3 | GET `/api/ps` | PASS | both models loaded, details + expires_at + size_vram |
-| B1.4 | POST `/api/show` `{"name":...}` | PASS | modelfile/parameters/template/details for `tiny-evo`; 404 for unknown |
-| B1.5 | POST `/api/show` `{"model":...}` (OpenCode format) | **FAIL** | 404 `Model not installed: ` — handler reads only `name`; real Ollama falls back `name = model` |
-| B1.6 | `/api/show` returns `capabilities` | **FAIL** | absent → OpenCode discovery filters ENR models out (requires `completion`) |
-| B1.7 | `/api/show` returns `model_info.*.context_length` | **FAIL** | absent → OpenCode context limit unknown |
-| B1.8 | POST `/api/chat` non-stream | PASS | correct `model/created_at/message/done/done_reason/total_duration/prompt_eval_count/eval_count` |
-| B1.9 | POST `/api/chat` stream | PASS | NDJSON chunks; final chunk `done:true` with counts |
-| B1.10 | POST `/api/generate` non-stream | PASS | correct `response`/`done` shape |
-| B1.11 | POST `/api/generate` stream | PASS | NDJSON chunks |
-| B1.12 | Multi-turn messages | PASS | system/user/assistant/tool roles accepted; structure preserved |
-| B1.13 | Unknown model `/api/chat` | **FAIL** | 400 structured error; real Ollama returns 404 `{"error":"model 'nope' not found"}` |
-| B1.14 | Missing model `/api/chat` | PASS | 400 (matches real Ollama status) |
-| B1.15 | Wrong method (POST `/api/tags`) | PASS | 405 |
-| B1.16 | Empty body | PASS | 400 |
-| B1.17 | Error body format | **FAIL** | ENR: `{"error":{"code":...,"message":...}}`; real Ollama: `{"error":"<string>"}` |
-| B1.18 | `format: "json"` | NOT TESTED (documented limitation) | ignored by ENR; local models cannot enforce JSON grammar |
+| B1 | Runtime lifecycle (start/load/unload/discovery) | PASS | `evo` + `tiny-evo` auto-loaded on CPU; `/api/ps`, `/api/tags` correct |
+| B2 | Native inference (CPU) | PASS | `tiny-evo "hello"` → deterministic `token_4`; tokens `[4,2]` (EOS excluded from text) |
+| B3 | Streaming (native SSE, Ollama NDJSON, OpenAI SSE) | PASS | correct framing + final done chunk |
+| B4 | Context / multi-turn | PASS | prompt flattening; no cross-request contamination (deterministic repeats) |
+| B5 | Stability / concurrency | PARTIAL | `max_concurrent_sessions=8` enforced; excess → HTTP 500 (see F4) |
+| C | Providers | PASS | none configured at baseline; add/test/remove + key redaction verified |
+| D1 | Native API | PASS | all endpoints respond |
+| D2 | Ollama protocol | PASS | version/tags/show/ps/chat/generate; capabilities + model_info present |
+| D2 | `/api/show` `{"model":...}` fallback | PASS | (fix from prior iteration re-verified) |
+| D3 | Tool calling (provider route) | PASS | live DeepSeek structured `tool_calls` + streaming + round-trip |
+| D3 | Tool calling (native text-only model) | PASS | explicit 400 "does not support tools" (matches real Ollama) |
+| D4 | Malformed JSON status | **FAIL** | returned **404**; should be **400** (real Ollama returns 400) |
+| D4 | Unknown model | PASS | 404 plain-string error |
+| D4 | Missing model | PASS | 400 |
+| E1 | OpenCode + cloud DeepSeek | PASS | this agent (deepseek/deepseek-v4-pro) |
+| E2 | OpenCode + ENR | PARTIAL | discovery + routing verified; agentic inference BLOCKED (text-only native model) |
+| F | Terminal execution | PASS | real shell, real outputs |
+| G1 | Java end-to-end (DeepSeek agent) | PASS | exact `ENR_AUTONOMOUS_TEST_OK`, exit 0 |
 
-### B2. Tool calling (`/api/chat`)
+## 4. Root-cause analysis (this iteration)
 
-| # | Scenario | Result | Evidence |
-| --- | --- | --- | --- |
-| B2.1 | `tools` definitions accepted | **FAIL** | `tools` field ignored entirely; response has no `tool_calls` |
-| B2.2 | Structured tool calls in response | **FAIL** | never produced |
-| B2.3 | `tool_calls` in assistant message + `tool` role message round-trip | **FAIL** | flattened into text prompt; role `tool` treated as user text |
-| B2.4 | Multiple tool calls | NOT TESTED | blocked by B2.1 |
-| B2.5 | Tool result → next assistant response | NOT TESTED | blocked by B2.3 |
-| B2.6 | Distinguish structured tool call vs plain text | **FAIL** | not possible — no structured tool call path exists |
+1. **Malformed JSON → 404 (should be 400)** — `Json.parse` throws `IllegalArgumentException`;
+   the handlers' `catch (IllegalArgumentException e) → 404` (intended for "model not found") also
+   catches JSON parse errors. Affects `/api/chat`, `/api/generate`, `/api/show`, `/api/delete`,
+   `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/api/v1/chat`.
+   Real Ollama returns `400 {"error":"invalid character ..."}`.
+2. **`EnrClient.unloadModel()`/`cancel()` silently ignore HTTP errors** — these methods call
+   `request(...)` but never `asObject(...)`, so a 404 ("Model not loaded") or 409 ("model in use")
+   is swallowed; `enr unload nope` printed "Unloaded model: nope".
+3. **`enr.yaml` stale `model_directories`** — pointed at the former repo path
+   `/home/petr/git/evo-native-runtime-161126/...`; models auto-loaded from the old location.
+4. **Concurrent-session-limit rejection → 500** (finding, not fixed) — `SessionManager` throws
+   `IllegalStateException`, which maps to the generic `catch (Exception) → 500`; should be 429/503.
 
-Reference behavior (real Ollama 0.40.16): models without tool support return HTTP 400
-`{"error":"registry.ollama.ai/library/smollm:135m does not support tools"}`.
+## 5. Fixes implemented (this iteration)
 
-### B3. OpenCode integration
+### F1. Malformed JSON → 400 on protocol endpoints
+- **Files**: `enr-core/.../json/JsonParseException.java` (NEW), `enr-core/.../json/Json.java`,
+  `enr-server/.../OllamaApiHandlers.java`, `OpenAiApiHandlers.java`, `ManagerApiHandlers.java`.
+- **Root cause**: see §4.1.
+- **Correction**: new `JsonParseException extends IllegalArgumentException` thrown by `Json.parse`;
+  handlers catch it specifically → 400 before the `IllegalArgumentException` → 404 catch.
+  (`/v1/embeddings` body parse moved inside its try.)
+- **Verification**: malformed JSON → 400 on `/api/chat`, `/api/generate`, `/api/show`,
+  `/v1/chat/completions`; unknown model still 404. Regression tests: `chatMalformedJsonReturns400`,
+  `generateMalformedJsonReturns400`, `openAiChatMalformedJsonReturns400`.
 
-| # | Scenario | Result | Evidence |
-| --- | --- | --- | --- |
-| B3.1 | ENR discoverable as native Ollama provider | **FAIL/BLOCKED** | blocked by B1.5 + B1.6 (no `capabilities` in `/api/show`) |
-| B3.2 | Model selection via `/models` | NOT TESTED | blocked by B3.1 |
-| B3.3 | Inference through ENR from OpenCode | NOT TESTED | blocked by B3.1 |
+### F2. `EnrClient.unloadModel()`/`cancel()` propagate errors
+- **File**: `enr-java-api/.../EnrClient.java`.
+- **Root cause**: see §4.2.
+- **Correction**: wrap both in `asObject(request(...))`.
+- **Verification**: `enr unload nope` → `ERROR: Model not loaded: nope` (was success).
+  Regression test: `unloadModelNotLoadedFails` (expects `EnrException` status 404).
 
-The current global OpenCode config maps the `ollama` provider to `http://127.0.0.1:11434/v1` (real Ollama),
-so ENR was not configured there at baseline. Testing used a project-scoped config (see Section 7).
+### F3. `enr.yaml` model directory path
+- **File**: `enr.yaml`.
+- **Correction**: `model_directories` → `/home/petr/git/enr-221126/enr-model-loader/src/test/resources/models`.
+- **Verification**: server log shows models loaded from the current repo path.
 
-### B4. Terminal execution (DeepSeek agent, OpenCode bash tool)
+## 6. Post-fix results
 
-| # | Scenario | Result | Evidence |
-| --- | --- | --- | --- |
-| B4.1 | `pwd`, `whoami`, `uname -a`, `java -version`, `mvn -version`, `git --version` | PASS | all executed; java 1.8 default, JDK 21/25 installed |
-| B4.2 | Dedicated temp workspace | PASS | `/tmp/opencode/enr-terminal-test` created |
-| B4.3 | Directory + file create/read | PASS | `subdir/sample.txt` written and read back |
-| B4.4 | Text processing | PASS | `wc -l` = 2 |
-| B4.5 | SHA256 | PASS | `84423fd5...` computed |
-| B4.6 | Multiple sequential commands | PASS | `(pwd; ls; wc -l)` in one invocation |
-| B4.7 | Working directory preservation | PASS | `pwd` = `/tmp/opencode/enr-terminal-test` |
-| B4.8 | Exit codes | PASS | nonexistent path → exit 2; `false` → exit 1 |
-| B4.9 | Failed command handling | PASS | failure reported as output, not claimed as success |
-
-### B5. End-to-end Java scenario (DeepSeek agent)
-
-| # | Scenario | Result | Evidence |
-| --- | --- | --- | --- |
-| B5.1 | Inspect Java env | PASS | JDK 21 at `/usr/lib/jvm/java-21-openjdk-amd64` |
-| B5.2 | Minimal Java app | PASS | `EnrAutonomousTest.java` created |
-| B5.3 | Compile with installed JDK | PASS | `javac` (JDK 21) succeeded |
-| B5.4 | Execute | PASS | `ENR_AUTONOMOUS_TEST_OK` printed exactly, exit 0 |
-
-## 4. Root-cause analysis
-
-1. **`/api/show` ignores `model` field** — `OllamaApiHandlers.show` reads only `request.getString("name")`.
-   Real Ollama falls back to `model` when `name` is empty. OpenCode discovery sends `{"model": ...}`.
-2. **No `capabilities` in `/api/show`/`/api/tags`** — `EnrManager.ollamaShow()/ollamaTags()` never emit the field.
-   OpenCode's Ollama plugin filters out models whose `/api/show` lacks `completion`.
-3. **No `model_info`** — context length is only available as `details.context_length`, not in `model_info.*.context_length`
-   form consumed by OpenCode.
-4. **No tool calling support** — `ChatMessage` is text-only; `OllamaApiHandlers.messagesFrom`,
-   `OpenAiApiHandlers.messagesFrom` and `ProviderClient.openAiBody` drop `tools`/`tool_calls`; responses never emit `tool_calls`.
-5. **Error format deviation** — `HttpSupport.sendError` emits structured `{"error":{"code","message"}}` on all endpoints;
-   the Ollama protocol expects `{"error":"<string>"}` and 404 for unknown models.
-6. **Unknown model status** — `/api/chat` and `/api/generate` map `IllegalArgumentException` to 400; real Ollama uses 404.
-
-## 5. Defect severity
-
-| Defect | Severity | Impact |
-| --- | --- | --- |
-| Tool calling absent (B2) | High | breaks agentic integrations using ENR as Ollama provider |
-| `/api/show` missing capabilities/model_info + `model` field (B1.5–B1.7) | High | blocks OpenCode model discovery entirely |
-| Ollama error format + status deviations (B1.13, B1.17) | Medium | breaks clients that parse `error` as string / expect 404 |
-| `format: json` ignored (B1.18) | Low | documented limitation (local text-only models) |
-
-## 6. Planned fixes (Phase D, this iteration)
-
-1. `/api/show`: accept `model` fallback; emit `capabilities` and `model_info.*.context_length`.
-2. `/api/tags`: per-model `capabilities` for parity with Ollama 0.40.
-3. Ollama endpoints: plain `{"error":"..."}` bodies; 404 for unknown model on `/api/chat` and `/api/generate`.
-4. Tool calling:
-   - parse `tools` + `tool_calls`/`tool` messages on `/api/chat` (Ollama format) and `/v1/chat/completions` (OpenAI format);
-   - forward tools to OpenAI-compatible providers (DeepSeek, OpenAI, Ollama /v1, llama.cpp);
-   - structured `tool_calls` in non-streaming and streaming responses (both formats);
-   - local native models without tool support → HTTP 400 (mirrors real Ollama);
-   - Anthropic/Gemini provider routes → explicit 400 (unsupported translation, no silent dropping).
-5. Regression tests for each fix in `enr-tests`.
-
-## 7. Reproduction
-
-```bash
-cd /home/petr/git/evo-native-runtime-161126
-JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 mvn package
-setsid -f ./enr.sh serve -c enr.yaml > /tmp/opencode/enr-server.log 2>&1 < /dev/null
-curl -s http://127.0.0.1:8111/api/version
-# B1 checks
-curl -s -X POST http://127.0.0.1:8111/api/show -d '{"model":"tiny-evo"}'          # baseline: 404
-curl -s -X POST http://127.0.0.1:8111/api/chat -d '{"model":"nope","messages":[{"role":"user","content":"hi"}]}'
-# B2 check (baseline: tools silently ignored)
-curl -s -X POST http://127.0.0.1:8111/api/chat -d '{"model":"tiny-evo","messages":[{"role":"user","content":"weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"...","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"stream":false}'
-```
-
-Post-fix results are recorded in the "Post-Fix Results" section after implementation.
-
----
-
-# Post-Fix Results
-
-## 1. Fixes implemented
-
-### F1. `/api/show` — model field fallback, capabilities, model_info
-- **File**: `enr-server/.../OllamaApiHandlers.java`, `enr-manager/.../EnrManager.java`
-- **Root cause**: handler read only `name`; real Ollama falls back to `model` (OpenCode discovery sends `{"model": ...}`).
-  `capabilities`/`model_info` were never emitted, so OpenCode's built-in Ollama discovery filtered ENR models out.
-- **Correction**: `name = model` fallback; `capabilities: ["completion"]` in `/api/show` (and per-model in `/api/tags`);
-  `model_info: {general.parameter_count, general.context_length}` from the loaded model.
-- **Verification**: `curl -X POST /api/show -d '{"model":"tiny-evo"}'` → 200 with capabilities + model_info (was 404).
-  Regression tests: `showAcceptsModelFieldLikeRealOllama`, `showWithoutLoadedModelStillAdvertisesCapabilities`, `tagsAdvertiseCapabilitiesPerModel`.
-
-### F2. Ollama error format + status codes
-- **File**: `enr-server/.../OllamaApiHandlers.java`
-- **Root cause**: shared `HttpSupport.sendError` produced `{"error":{"code","message"}}`; real Ollama uses `{"error":"<string>"}`;
-  unknown models returned 400 instead of 404.
-- **Correction**: `sendOllamaError` helper emitting plain-string errors on all `/api/*` endpoints;
-  `IllegalArgumentException` from route resolution maps to 404 on `/api/chat` and `/api/generate`.
-- **Verification**: unknown model chat/generate/show → 404 `{"error":"Model 'nope' is not installed..."}`.
-  Regression tests: `chatUnknownModelReturns404WithPlainError`, `generateUnknownModelReturns404WithPlainError`, `showUnknownModelReturns404WithPlainError`.
-
-### F3. Tool calling (Ollama `/api/chat` + OpenAI `/v1/chat/completions`)
-- **Files**: `ChatMessage.java` (optional protocol payload), `EnrManager.java` (ChatOptions.tools,
-  `ToolCallingUnsupportedException`, pre-flight `validateTools`, tool_calls/reasoning mapping),
-  `ProviderClient.java` (OpenAI-wire tool serialization, tool_call_id synthesis, streaming tool-call delta
-  aggregation, `reasoning_content` capture/echo), `OllamaApiHandlers.java`, `OpenAiApiHandlers.java`,
-  `ManagerApiHandlers.java` (parse + response converters).
-- **Root cause**: no tool support existed anywhere; `tools` was silently dropped and `tool`-role messages
-  flattened into text. Additionally, DeepSeek thinking-mode requires `reasoning_content` (even `""`) to be
-  echoed back on assistant messages — multi-turn tool flows 422'd without it.
-- **Correction**:
-  - `tools` forwarded to OpenAI-compatible providers (DeepSeek/OpenAI/Ollama `/v1`/llama.cpp) in both wire formats;
-  - canonical internal form with format conversion at the API boundaries (Ollama `{function:{name,arguments:object}}`
-    ↔ OpenAI `{id,type,function:{name,arguments:string}}`);
-  - streaming: tool-call deltas aggregated; final chunk carries full `tool_calls` + `finish_reason: "tool_calls"`;
-  - tool results: `tool_call_id` synthesized from the preceding assistant tool_calls when the client format lacks it;
-  - `reasoning_content` (OpenAI) ↔ `thinking` (Ollama) captured, exposed and echoed;
-  - local native models and Anthropic/Gemini routes reject tools explicitly with HTTP 400 (mirrors real Ollama:
-    `{"error":"registry.../smollm:135m does not support tools"}`, 400).
-- **Verification (live)**:
-  - `/api/chat` (Ollama format) → `deepseek:deepseek-flash`: structured `message.tool_calls`
-    `[{function:{name:"get_weather",arguments:{city:"Paris"}}}]`, `done_reason:"tool_calls"` ✓
-  - full multi-turn: user → assistant(tool_calls) → tool result → final answer "Right now in Paris it's **22°C and sunny**." ✓
-  - streaming `/api/chat`: final NDJSON chunk with tool_calls + done_reason "tool_calls" ✓
-  - `/v1/chat/completions` non-stream + stream: OpenAI-format tool_calls, `finish_reason:"tool_calls"`,
-    `reasoning_content:"..."` echoed ✓
-  - local model + tools → 400 before headers (stream and non-stream) ✓
-  - 15 regression tests in `OllamaToolCallingTest` (mock OpenAI-compatible provider with captured requests).
-
-### F4. Config storage paths (found during testing)
-- **File**: `enr-manager/.../EnrConfigLoader.java`
-- **Root cause**: `~` in `storage.*_dir` was not expanded → literal `~` directory created under the process CWD;
-  the YAML-subset parser also kept inline comments as part of values
-  (e.g. `models_dir` became `~/.enr/models   # installed models (one directory per model)`).
-- **Correction**: `expandHome()` for leading `~/`; `stripComment()` for trailing `# comments` (quote-aware).
-- **Verification**: started ENR from the repo dir — no stray `~` or comment-suffixed dirs; data lands in `~/.enr`.
-  Regression tests: `storagePathsExpandTilde`, `yamlInlineCommentsAreStripped`.
-
-### F5. OpenAI streaming robustness (latent bug found in F3 work)
-- **File**: `ProviderClient.openAiStream`
-- **Root cause**: if an upstream provider omitted `finish_reason`/usage chunk, no terminal `done` chunk was
-  ever emitted; usage-only chunks could double-emit the terminal chunk.
-- **Correction**: single terminal-chunk emission with accumulated usage + tool calls; end-of-stream fallback.
-- **Verification**: covered by streaming tool tests against the mock provider and live DeepSeek streams.
-
-## 2. Post-fix test matrix
-
-### B1. Ollama protocol (re-run)
+- Build: `mvn clean package` — **BUILD SUCCESS** (13 modules).
+- Tests: **160 tests, 0 failures** (156 baseline + 4 new regression tests; `enr-tests` = 110).
 
 | Scenario | Before | After |
 | --- | --- | --- |
-| `/api/version` | PASS | PASS |
-| `/api/tags` (+ capabilities) | partial | PASS |
-| `/api/show` `{"name":...}` | PASS | PASS |
-| `/api/show` `{"model":...}` | FAIL | **PASS** |
-| `/api/show` capabilities/model_info | FAIL | **PASS** |
-| `/api/chat` non-stream/stream | PASS | PASS |
-| `/api/generate` non-stream/stream | PASS | PASS |
-| multi-turn | PASS | PASS |
-| unknown model status | FAIL (400) | **PASS (404)** |
-| error body format | FAIL | **PASS** (plain string) |
-| wrong method / missing model | PASS | PASS |
+| Malformed JSON `/api/chat` | FAIL (404) | **PASS (400)** |
+| Malformed JSON `/api/generate` | FAIL (404) | **PASS (400)** |
+| Malformed JSON `/api/show` | FAIL (404) | **PASS (400)** |
+| Malformed JSON `/v1/chat/completions` | FAIL (404) | **PASS (400)** |
+| Unknown model | PASS (404) | PASS (404) |
+| `enr unload` of non-loaded model | FAIL (silent success) | **PASS (error)** |
+| Model dir resolves to current repo | FAIL (stale path) | **PASS** |
+| Native inference determinism | PASS | PASS |
+| Live DeepSeek tool calling (Ollama + OpenAI + streaming) | PASS | PASS |
+| OpenCode + DeepSeek (this agent) | PASS | PASS |
+| Java end-to-end | PASS | PASS |
 
-### B2. Tool calling
+## 7. Remaining limitations
 
-| Scenario | Before | After |
-| --- | --- | --- |
-| tools accepted → structured tool_calls (provider route) | FAIL | **PASS** |
-| streaming tool_calls (Ollama + OpenAI formats) | FAIL | **PASS** |
-| tool_calls + tool-result round-trip | FAIL | **PASS** |
-| tools on local text-only model | silent ignore | **PASS** (explicit 400, matches real Ollama) |
-| multiple tool calls | NOT TESTED | covered by aggregation logic + mock stream (single-call verified live) |
+- **L1 — ENR-native models are text-only toys**: `tiny-evo` (920 params, ctx 32) and `evo`
+  (53952 params, ctx 4) are synthetic fixtures with a literal `token_N` vocabulary. They cannot
+  produce meaningful text, and structured tool calling on native models is rejected with 400
+  (`capabilities: ["completion"]` only) — this mirrors real Ollama for models without the `tools`
+  capability.
+- **L2 — OpenCode agentic inference through ENR-native inference is BLOCKED**: OpenCode's agentic
+  `build` agent always sends tool definitions; ENR's text-only native models reject them (400).
+  Discovery and request routing through ENR are verified, and the rejection is honest, but a
+  successful agentic multi-turn through a native model is not possible with the bundled models.
+- **L3 — concurrent-session-limit rejection uses HTTP 500** instead of 429/503 (finding F4, deferred).
+- **L4 — native `/api/v1/inference` requires an explicit model load** (no on-demand auto-load),
+  unlike the Ollama `/api/chat`/`/api/generate` path which auto-loads via `ensureLoaded`. This is a
+  deliberate low-level vs high-level API distinction.
+- **L5 — Anthropic/Gemini tool translation** not implemented; tool requests on those provider types
+  fail explicitly with 400 (no silent dropping) — unchanged from the prior iteration.
+- **L6 — `/v1/embeddings`** returns 501 for local models (native runtime exposes logits only);
+  supported only via OpenAI-compatible providers.
 
-### B3. OpenCode integration
+## 8. Audit evidence
 
-| Scenario | Before | After |
-| --- | --- | --- |
-| ENR discoverable in OpenCode | FAIL/BLOCKED | **PASS at protocol level** (see limitation L1) |
-| inference through ENR from OpenCode | NOT TESTED | **PASS** |
-| tool calling through ENR from OpenCode | NOT TESTED | **PASS** |
-| error propagation to OpenCode | NOT TESTED | **PASS** |
+- Audit run persisted (append-only) under `/home/petr/.evo/audit/`:
+  - runId: `enr-func-test-20261123-iter1` (13 modules, 4 failures recorded, `DEGRADED`).
+  - A pre-existing run `evo-native-v2-integrity-20261123` (separate EVO-platform campaign) was preserved, not overwritten.
+- Server log: `/tmp/opencode/enr-campaign/enr-server.log`.
+- Java e2e artifact: `/tmp/opencode/enr-campaign/java-e2e/` (`ENR_AUTONOMOUS_TEST_OK`, exit 0).
 
-Verified live: OpenCode 1.19.6 (`build` agent) with `provider.ollama.options.baseURL = http://127.0.0.1:8111/v1`
-and model `deepseek:deepseek-flash` routed through ENR:
-- executed `pwd`, `whoami`, `uname -a`, `java -version`, `mvn -version`, `git --version` through its shell tool
-  and reported the actual outputs (matching machine reality, incl. JAVA_TOOL_OPTIONS side effect);
-- created/compiled/ran a Java program — exact output `ENR_AUTONOMOUS_TEST_OK`, exit 0 — reported real results.
-- text-only `tiny-evo` + agent tools → ENR 400 "does not support tools" surfaced cleanly in OpenCode.
-
-### B4. Terminal execution — PASS (unchanged; documented in baseline)
-
-### B5. End-to-end Java scenario
-
-| Scenario | Before | After |
-| --- | --- | --- |
-| direct (DeepSeek agent) | PASS | PASS |
-| through OpenCode → ENR → DeepSeek | NOT TESTED | **PASS** (exact `ENR_AUTONOMOUS_TEST_OK`, exit 0) |
-
-## 3. Build and test results (post-fix)
-
-- `JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64 mvn package` — BUILD SUCCESS (13 modules)
-- `mvn test` — all modules green; `enr-tests`: **105 tests, 0 failures** (88 baseline + 17 new regression tests)
-
-## 4. Remaining limitations
-
-- **L1 — OpenCode V1 discovery**: the installed OpenCode (1.19.6) is the V1 config generation; its Ollama
-  integration uses the OpenAI-compatible `/v1` surface (`npm: @ai-sdk/openai-compatible`) and config-declared
-  models — the native `/api/tags`+`/api/show` auto-discovery belongs to OpenCode V2 (verified in V2 source;
-  ENR now satisfies its requirements: `capabilities:["completion"]`, `model_info.*.context_length`, `{"model":...}`).
-  ENR's `/v1/chat/completions` (with the new tool/reasoning support) is exactly the surface V1 uses.
-- **L2 — local native models are text-only**: no structured tool calls, `format:"json"` not enforced;
-  tools requests are rejected with 400 (advertised as `["completion"]` only). This mirrors real Ollama behavior
-  for models without the `tools` capability.
-- **L3 — Anthropic/Gemini tool translation**: not implemented; tool requests on those provider types fail
-  explicitly with 400 (no silent dropping).
-- **L4 — streamed token counts for DeepSeek**: DeepSeek streaming does not always include usage
-  (`stream_options.include_usage` not honored), so `prompt_eval_count`/`eval_count` can be 0 in streamed
-  final chunks. Non-stream responses carry correct counts.
-- **L5 — multi-tool-call aggregation** verified against the mock stream; live DeepSeek produced single tool
-  calls in the tested scenarios.
-
-## 5. Out-of-scope observations
-
-- `enr-server/src/main/resources/web/*` (theme toggle) changed during the session by an external process
-  (UPM design-standard sync); not part of this iteration and left untouched.
-- Pre-existing uncommitted changes (web_server config support in EnrConfig/EnrConfigLoader/EnrManager/EnrServer
-  + enr.yaml) were treated as baseline and were not authored by this iteration.
-
-## 6. Files modified (this iteration)
+## 9. Files modified (this iteration)
 
 | File | Change |
 | --- | --- |
-| `enr-manager/.../provider/ChatMessage.java` | optional payload for tool_calls/tool_call_id/reasoning |
-| `enr-manager/.../provider/ProviderClient.java` | tools in ChatOptions; tool-aware OpenAI serialization; streaming tool-call aggregation; reasoning_content capture/echo; robust stream termination |
-| `enr-manager/.../EnrManager.java` | ChatOptions.tools; ToolCallingUnsupportedException; validateTools; tool_calls/reasoning mapping; show/tags capabilities + model_info |
-| `enr-manager/.../EnrConfigLoader.java` | tilde expansion + inline-comment stripping |
-| `enr-server/.../OllamaApiHandlers.java` | model-field fallback; plain-string errors; 404 mapping; tool parsing/response conversion; thinking field |
-| `enr-server/.../OpenAiApiHandlers.java` | tools/reasoning parse + response; validateTools pre-flight |
-| `enr-server/.../ManagerApiHandlers.java` | tools in ChatOptions; validateTools pre-flight |
-| `enr-tests/.../MockServers.java` | tool-calling mock OpenAI provider |
-| `enr-tests/.../OllamaToolCallingTest.java` | NEW — 17 regression tests |
-| `docs/testing/ENR_INITIAL_TEST_REPORT.md` | this report |
-| `docs/testing/ENR_TESTING_GUIDE.md` | NEW — reproducible testing guide |
+| `enr-core/src/main/java/ai/enr/core/json/JsonParseException.java` | NEW — `JsonParseException extends IllegalArgumentException` |
+| `enr-core/src/main/java/ai/enr/core/json/Json.java` | `error()` returns `JsonParseException` |
+| `enr-java-api/src/main/java/ai/enr/client/EnrClient.java` | `unloadModel`/`cancel` check HTTP status |
+| `enr-server/src/main/java/ai/enr/server/OllamaApiHandlers.java` | malformed JSON → 400 (show/delete/chat/generate) |
+| `enr-server/src/main/java/ai/enr/server/OpenAiApiHandlers.java` | malformed JSON → 400 (chat/completions/embeddings) |
+| `enr-server/src/main/java/ai/enr/server/ManagerApiHandlers.java` | malformed JSON → 400 (chat) |
+| `enr-tests/src/test/java/ai/enr/tests/OllamaToolCallingTest.java` | +3 regression tests (malformed JSON → 400) |
+| `enr-tests/src/test/java/ai/enr/tests/ApiIntegrationTest.java` | +1 regression test (unload not-loaded fails) |
+| `enr.yaml` | `model_directories` → current repo path |
+
+> Note: `target/` build artifacts (`.class`/`.jar`) are tracked in this repository's git history
+> (pre-existing); rebuilding regenerated them. They were not committed, and no Git commit/push was
+> performed, per the campaign restrictions.
+
+---
+
+# Iteration 2 — Harness Gateway (2026-11-23)
+
+Objective: make ENR a reliable LLM gateway connecting providers/models to agentic harnesses
+(OpenCode), with the full agentic lifecycle — not just the first inference request.
+
+## Result summary
+
+**P0 ACHIEVED — ENR is READY FOR HARNESS INTEGRATION** for the gateway role. A real OpenCode
+session, configured to use ENR as its only LLM backend (model `deepseek:deepseek-flash` routed
+through ENR to the DeepSeek provider), completed a full agentic coding task: read a source file,
+edit it, run a shell command, inspect the output, continue reasoning, and produce a final answer —
+with **all LLM traffic passing through ENR** (7 chat requests logged, conversation growing 1→10
+messages, 14 tool definitions, streaming throughout).
+
+## Changes (this iteration)
+
+| Area | Change |
+| --- | --- |
+| Provider error propagation | `ChatResult` gains a `status` field + `gatewayStatus` mapping: 429→429, 408→504, 401/403→502, 502/503/504→same, other→502 (was blanket 500). Propagated through `EnrManager` (`error_status`) to Ollama/OpenAI/Manager handlers. |
+| Request logging | `EnrManager` logs each chat/chatStream request (model, target, provider, message count, tools, stream) — enables lifecycle verification via `/api/v1/logs`. |
+| CLI commands | Added `enr ps`, `enr show <model>`, `enr run <model>`, `enr rm <model>`, `enr version`. |
+| Ollama endpoints | Added `/api/copy` (duplicate installed model) and `/api/embed` (local→501, OpenAI-compatible provider forwarded). |
+| Regression tests | `ProviderErrorPropagationTest` (6 tests), `/api/copy` + `/api/embed` tests (4 tests). |
+
+## Compatibility matrix (verified this iteration)
+
+### Ollama-compatible API (`/api/*`)
+
+| Endpoint | Status | Notes |
+| --- | --- | --- |
+| `/api/version` | Fully compatible | `{"version":"2.6.11","name":"ENR"}` |
+| `/api/tags` | Fully compatible | local models + `capabilities` |
+| `/api/ps` | Fully compatible | loaded models + `parameter_size` |
+| `/api/show` | Fully compatible | `model`/`name` fallback, `capabilities`, `model_info` |
+| `/api/chat` | Fully compatible | non-stream + NDJSON stream, multi-turn, tool calling |
+| `/api/generate` | Fully compatible | non-stream + stream |
+| `/api/embed` | Partially compatible | local→501; forwarded to OpenAI-compatible providers |
+| `/api/pull` | Partially compatible | streaming progress; catalogs (Ollama Library + Hugging Face GGUF) |
+| `/api/delete` | Fully compatible | removes installed model |
+| `/api/copy` | Fully compatible | duplicates an installed model |
+| `/api/create` | **Unsupported** | Modelfile→model creation deferred (out of harness-integration scope) |
+
+### OpenAI-compatible API (`/v1/*`)
+
+| Endpoint | Status | Notes |
+| --- | --- | --- |
+| `/v1/models` | Fully compatible | local + provider-qualified model ids |
+| `/v1/chat/completions` | Fully compatible | non-stream + SSE stream, tool calling, `reasoning_content` |
+| `/v1/completions` | Fully compatible | text completion |
+| `/v1/embeddings` | Partially compatible | local→501; forwarded to OpenAI-compatible providers |
+
+## OpenCode integration (real, not mocked)
+
+- Config: custom `enr` provider (openai-compatible) → `baseURL http://127.0.0.1:8111/v1`,
+  model `ds-flash` → `modelID "deepseek:deepseek-flash"`, `tools: true`.
+- Task: edit `calc.py` (add `multiply`), run `python3 -c "from calc import multiply; print(multiply(6,7))"`,
+  report actual output.
+- Result: `multiply` added, command output `42` reported accurately.
+- Evidence: ENR `/api/v1/logs` shows 7 `chat` requests (`target=provider provider=deepseek`,
+  `messages=1..10`, `tools=14`, `stream=true`); the file was edited on disk. No direct
+  OpenCode→DeepSeek connection existed (the `enr` provider only knows `127.0.0.1:8111`).
+
+## Build and test results
+
+- `mvn clean package` (JDK 25, release 21) — **BUILD SUCCESS**, 13 modules.
+- Tests: **170 tests, 0 failures** (`enr-tests` = 120; was 110 at end of iter1).
+
+## Remaining limitations
+
+- **Native EVO models are text-only toys** (no native structured tool calling, tiny context) —
+  secondary per campaign; agentic inference is served through providers.
+- **`/api/create` not implemented** (Modelfile→model creation deferred).
+- **Concurrent-session-limit rejection still returns HTTP 500** (should be 429) — pre-existing finding.
+- **Anthropic/Gemini tool translation** not implemented (explicit 400).
+
+## Audit evidence (iter2)
+
+- Audit run: `enr-harness-gateway-20261123-iter2` (8 modules, 1 resolved finding, `DEGRADED`),
+  chained to `previousRunId: enr-func-test-20261123-iter1`. All three runs preserved append-only.
+- OpenCode test project: `/tmp/opencode/enr-agent-test/`.
+
+---
+
+# Iteration 3 — Complete Ollama-Compatible Model Lifecycle + Hugging Face (2026-11-23)
+
+Objective: make ENR a practical drop-in Ollama alternative for local model acquisition and execution,
+with Hugging Face GGUF repositories as the primary source.
+
+## Implemented (this iteration)
+
+- **Hugging Face GGUF discovery**: `hf.co/OWNER/REPO:QUANT` (and `hf:`, `huggingface.co:` prefixes)
+  resolves the repository via the HF tree API and selects the single GGUF matching the quantization
+  tag; missing/ambiguous quantizations produce clear errors listing alternatives. `lfs.oid` is used
+  as the SHA-256 verification digest.
+- **HF token auth**: `catalogs.huggingface_token` (or `HF_TOKEN` env) sent as a Bearer header for
+  gated repositories — never logged or returned by the API.
+- **Resumable downloads**: `DownloadManager` resumes via `Range` from a `.part` file; SHA-256
+  verification; explicit cancel cleans up, network interruption keeps the partial for retry.
+- **CLI**: `enr copy <src> <dst>`, `enr stop <model>`, and `enr run <model>` with automatic pull
+  (skip if installed), explicit load, and honest load-failure reporting.
+- **HTTP**: `/api/v1/catalog/ensure` and `/api/v1/catalog/copy` (manager endpoints).
+- **Fixed pre-existing bug**: HF repo was parsed as only the first path segment
+  (`hf:OWNER/REPO/FILE.gguf` produced a broken `OWNER/resolve/main/REPO/FILE.gguf` URL).
+
+## Real-world acceptance results
+
+| Step | Result |
+| --- | --- |
+| Model initially absent | PASS |
+| `enr pull hf.co/bartowski/SmolLM2-135M-Instruct-GGUF:Q4_K_M` | PASS — 100.6 MB downloaded, SHA-256 verified, registered |
+| Persistent registration | PASS — survives restart |
+| `enr run` without re-download | PASS — skips download (`installed:true`) |
+| Real inference | **BLOCKED** — native runtime supports F32/F16 tensors only; `Q4_K_M` (GGML type 8) rejected with a clear error |
+| `enr stop` / `enr ps` / `/api/tags` / `/api/show` | PASS |
+| `enr copy` / `enr rm` + storage cleanup | PASS |
+
+The exact acceptance target `hf.co/unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` resolves correctly to the
+16.6 GB `Inkling-2-Mini-UD-Q4_K_M.gguf` (verified against the live HF API) but was not fully
+downloaded (≈1.7 h at the measured 2.7 MB/s); a smaller real GGUF was used to verify the complete
+download → register → restart → remove lifecycle.
+
+## Test results
+
+- `enr-tests`: **129 tests, 0 failures** (was 120; +9 `HuggingFaceCatalogTest`).
+- Full build compiles cleanly. **CUDA module (4 tests) BLOCKED by environmental GPU OOM** — the
+  real Ollama `llama-server` occupies 14.4 GB of the 16 GB GPU (`cuCtxCreate failed: 2`), unrelated
+  to these changes.
+
+## Remaining limitations
+
+- **Quantized GGUF (Q4_K_M etc.) cannot be executed natively** — the native runtime supports F32/F16
+  tensors only (P3-secondary; download ≠ inference). Use F16/F32 exports or a cloud provider.
+- **`/api/create` (Modelfile→model)** remains unimplemented.
+- CUDA tests currently BLOCKED by GPU contention from the real Ollama process.
+
+## Audit evidence (iter3)
+
+- Audit run: `enr-hf-lifecycle-20261123-iter3`, chained to `previousRunId: enr-harness-gateway-20261123-iter2`.
+- Real download evidence: `SmolLM2-135M-Instruct-GGUF:Q4_K_M` (100.6 MB, verified, then removed).
+
+

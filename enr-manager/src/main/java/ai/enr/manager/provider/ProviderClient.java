@@ -37,10 +37,30 @@ public final class ProviderClient implements AutoCloseable {
 
     public record ChatResult(String content, int promptTokens, int completionTokens,
                              String finishReason, long elapsedMs, boolean ok, String error,
-                             JsonValue toolCalls, String reasoningContent) {
+                             JsonValue toolCalls, String reasoningContent, int status) {
 
         public static ChatResult error(String message) {
-            return new ChatResult("", 0, 0, "error", 0, false, message, null, null);
+            return error(502, message);
+        }
+
+        public static ChatResult error(int status, String message) {
+            return new ChatResult("", 0, 0, "error", 0, false, message, null, null, status);
+        }
+
+        /**
+         * Maps an upstream provider HTTP status to the client-facing status ENR
+         * should return. Preserves meaningful status codes (rate limiting,
+         * gateway timeout, overload) while translating provider-side auth
+         * failures and other upstream errors into 502 Bad Gateway so the
+         * harness does not mistake them for its own request errors.
+         */
+        public static int gatewayStatus(int upstream) {
+            return switch (upstream) {
+                case 429 -> 429;                 // rate limit: propagate for backoff
+                case 408 -> 504;                 // upstream timeout -> gateway timeout
+                case 502, 503, 504 -> upstream;  // upstream gateway/overload codes
+                default -> 502;                  // auth (401/403) and other errors -> bad gateway
+            };
         }
     }
 
@@ -137,7 +157,8 @@ public final class ProviderClient implements AutoCloseable {
                 .header("Content-Type", "application/json")
                 .build());
         if (response.statusCode() != 200) {
-            return ChatResult.error("HTTP " + response.statusCode() + ": " + shortBody(response.body()));
+            return ChatResult.error(ChatResult.gatewayStatus(response.statusCode()),
+                    "HTTP " + response.statusCode() + ": " + shortBody(response.body()));
         }
         JsonObject obj = Json.parseObject(response.body());
         JsonArray choices = obj.getArray("choices");
@@ -161,7 +182,7 @@ public final class ProviderClient implements AutoCloseable {
         return new ChatResult(content,
                 usage == null ? 0 : usage.getInt("prompt_tokens", 0),
                 usage == null ? 0 : usage.getInt("completion_tokens", 0),
-                finish, System.currentTimeMillis(), true, "", toolCalls, reasoning);
+                finish, System.currentTimeMillis(), true, "", toolCalls, reasoning, 200);
     }
 
     private void openAiStream(Provider provider, String model, List<ChatMessage> messages,
@@ -528,7 +549,8 @@ public final class ProviderClient implements AutoCloseable {
                 .header("Content-Type", "application/json")
                 .build());
         if (response.statusCode() != 200) {
-            return ChatResult.error("HTTP " + response.statusCode() + ": " + shortBody(response.body()));
+            return ChatResult.error(ChatResult.gatewayStatus(response.statusCode()),
+                    "HTTP " + response.statusCode() + ": " + shortBody(response.body()));
         }
         JsonObject obj = Json.parseObject(response.body());
         StringBuilder content = new StringBuilder();
@@ -545,7 +567,7 @@ public final class ProviderClient implements AutoCloseable {
         return new ChatResult(content.toString(),
                 usage == null ? 0 : usage.getInt("input_tokens", 0),
                 usage == null ? 0 : usage.getInt("output_tokens", 0),
-                obj.getString("stop_reason", "end_turn"), System.currentTimeMillis(), true, "", null, null);
+                obj.getString("stop_reason", "end_turn"), System.currentTimeMillis(), true, "", null, null, 200);
     }
 
     private void anthropicStream(Provider provider, String model, List<ChatMessage> messages,
@@ -662,7 +684,8 @@ public final class ProviderClient implements AutoCloseable {
                 .header("Content-Type", "application/json")
                 .build());
         if (response.statusCode() != 200) {
-            return ChatResult.error("HTTP " + response.statusCode() + ": " + shortBody(response.body()));
+            return ChatResult.error(ChatResult.gatewayStatus(response.statusCode()),
+                    "HTTP " + response.statusCode() + ": " + shortBody(response.body()));
         }
         JsonObject obj = Json.parseObject(response.body());
         JsonArray candidates = obj.getArray("candidates");
@@ -688,7 +711,7 @@ public final class ProviderClient implements AutoCloseable {
         return new ChatResult(content,
                 usage == null ? 0 : usage.getInt("promptTokenCount", 0),
                 usage == null ? 0 : usage.getInt("candidatesTokenCount", 0),
-                finish, System.currentTimeMillis(), true, "", null, null);
+                finish, System.currentTimeMillis(), true, "", null, null, 200);
     }
 
     private void geminiStream(Provider provider, String model, List<ChatMessage> messages,

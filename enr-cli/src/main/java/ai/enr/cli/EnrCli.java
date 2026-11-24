@@ -67,13 +67,18 @@ public final class EnrCli {
                 }).orElse(1);
                 case "models" -> modelsCommand(rest);
                 case "list" -> list(rest);
+                case "ps" -> ps(rest);
+                case "show" -> show(rest);
+                case "run" -> runModel(rest);
                 case "pull" -> pull(rest);
-                case "remove" -> remove(rest);
+                case "remove", "rm" -> remove(rest);
+                case "copy" -> copy(rest);
                 case "import" -> importModel(rest);
                 case "load" -> load(rest);
                 case "unload" -> unload(rest);
                 case "infer" -> infer(rest);
                 case "chat" -> chat(rest);
+                case "version" -> version(rest);
                 case "devices" -> devices(rest);
                 case "diagnostics" -> diagnostics(rest);
                 case "provider", "providers" -> providers(rest);
@@ -359,6 +364,13 @@ public final class EnrCli {
     }
 
     private int stop(String[] args) throws IOException, InterruptedException {
+        // enr stop <model> — unload a model (Ollama-compatible)
+        if (args.length >= 1 && !args[0].startsWith("-")) {
+            var client = client(args).orElseThrow();
+            client.unloadModel(args[0], false);
+            System.out.println("Stopped model: " + args[0]);
+            return 0;
+        }
         String pidFile = "/tmp/enr.pid";
         Path pidPath = Path.of(pidFile);
         if (Files.exists(pidPath)) {
@@ -395,6 +407,72 @@ public final class EnrCli {
                     m.getBoolean("verified", false) ? "yes" : "no",
                     m.getString("source", "-"));
         }
+        return 0;
+    }
+
+    private int ps(String[] args) {
+        var client = client(args).orElseThrow();
+        JsonObject body = client.getJson("/api/ps");
+        JsonArray models = body.getArray("models");
+        if (models == null || models.size() == 0) {
+            System.out.println("No models loaded.");
+            return 0;
+        }
+        System.out.printf("%-24s %-18s %-10s%n", "NAME", "PARAMETERS", "SIZE");
+        for (int i = 0; i < models.size(); i++) {
+            JsonObject m = models.getObject(i);
+            JsonObject details = m.getObject("details");
+            System.out.printf("%-24s %-18s %-10s%n",
+                    m.getString("name", ""),
+                    details == null ? "-" : details.getString("parameter_size", "-"),
+                    humanBytes(m.getLong("size", 0)));
+        }
+        return 0;
+    }
+
+    private int show(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr show <model>");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        JsonObject body = new JsonObject();
+        body.put("name", args[0]);
+        JsonObject info = client.postJson("/api/show", body);
+        JsonObject details = info.getObject("details");
+        JsonArray capabilities = info.getArray("capabilities");
+        StringBuilder caps = new StringBuilder();
+        if (capabilities != null) {
+            for (int i = 0; i < capabilities.size(); i++) {
+                if (caps.length() > 0) {
+                    caps.append(',');
+                }
+                caps.append(capabilities.getString(i));
+            }
+        }
+        System.out.println("Model:     " + args[0]);
+        System.out.println("Format:    " + (details == null ? "-" : details.getString("format", "-")));
+        System.out.println("Parameters:" + (details == null ? "-" : details.getString("parameter_size", "-")));
+        System.out.println("Context:   " + (details == null ? "-" : details.getString("context_length", "-")));
+        System.out.println("Caps:      " + (caps.isEmpty() ? "-" : caps.toString()));
+        JsonObject modelInfo = info.getObject("model_info");
+        if (modelInfo != null) {
+            for (var entry : modelInfo.entries()) {
+                System.out.println("  " + entry.getKey() + " = " + Json.write(entry.getValue(), false));
+            }
+        }
+        String modelfile = info.getString("modelfile", "");
+        if (!modelfile.isBlank()) {
+            System.out.println("Modelfile:");
+            System.out.println(modelfile);
+        }
+        return 0;
+    }
+
+    private int version(String[] args) {
+        var client = client(args).orElseThrow();
+        JsonObject v = client.getJson("/api/version");
+        System.out.println("ENR " + v.getString("version", "unknown"));
         return 0;
     }
 
@@ -514,6 +592,20 @@ public final class EnrCli {
         return 0;
     }
 
+    private int copy(String[] args) {
+        if (args.length < 2) {
+            System.err.println("Usage: enr copy <source> <destination>");
+            return 1;
+        }
+        var client = client(args).orElseThrow();
+        JsonObject body = new JsonObject();
+        body.put("source", args[0]);
+        body.put("destination", args[1]);
+        client.postJson("/api/v1/catalog/copy", body);
+        System.out.println("Copied " + args[0] + " -> " + args[1]);
+        return 0;
+    }
+
     private int importModel(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: enr import <path> [--id modelId]");
@@ -557,18 +649,113 @@ public final class EnrCli {
             }
         }
         var client = client(args).orElseThrow();
+        return interactiveLoop(client, model, maxTokens, temperature, initialPrompt, multi);
+    }
+
+    /**
+     * {@code enr run <model>}: resolves the reference, auto-pulls if missing,
+     * loads and starts interactive inference (Ollama-style).
+     */
+    private int runModel(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: enr run <model> [\"prompt\"] [--max-tokens N] [--temperature F]");
+            return 1;
+        }
+        String ref = args[0];
+        Integer maxTokens = null;
+        Float temperature = null;
+        String initialPrompt = null;
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--max-tokens" -> maxTokens = Integer.parseInt(args[++i]);
+                case "--temperature" -> temperature = Float.parseFloat(args[++i]);
+                default -> initialPrompt = args[i];
+            }
+        }
+        var client = client(args).orElseThrow();
+        String id = ensureAvailable(client, ref);
+        if (id == null) {
+            return 1;
+        }
+        System.out.println("Loading model...");
+        try {
+            JsonObject start = new JsonObject();
+            start.put("id", id);
+            client.postJson("/api/v1/models/start", start);
+        } catch (RuntimeException e) {
+            System.err.println("Model loading failed: " + e.getMessage());
+            return 1;
+        }
+        System.out.println("Model ready.");
+        return interactiveLoop(client, id, maxTokens, temperature, initialPrompt, true);
+    }
+
+    /** Resolves a reference, pulling it if it is not already registered. */
+    private String ensureAvailable(EnrClient client, String ref) {
+        JsonObject body = new JsonObject();
+        body.put("name", ref);
+        JsonObject response = client.postJson("/api/v1/catalog/ensure", body);
+        String id = response.getString("id", "");
+        if (response.getBoolean("installed", false)) {
+            return id;
+        }
+        String downloadId = response.getString("download_id", "");
+        System.out.println("Resolving model...");
+        while (true) {
+            JsonObject downloads = client.getJson("/api/v1/downloads");
+            JsonArray arr = downloads.getArray("downloads");
+            JsonObject job = null;
+            if (arr != null) {
+                for (int i = 0; i < arr.size(); i++) {
+                    JsonObject entry = arr.getObject(i);
+                    if (downloadId.equals(entry.getString("id", ""))) {
+                        job = entry;
+                    }
+                }
+            }
+            if (job == null) {
+                System.err.println("Download job vanished.");
+                return null;
+            }
+            String status = job.getString("status", "");
+            if ("completed".equals(status)) {
+                System.out.println();
+                System.out.println("Success.");
+                return id;
+            }
+            if ("failed".equals(status) || "cancelled".equals(status)) {
+                System.err.println("Download " + status + ": " + job.getString("error", ""));
+                return null;
+            }
+            long total = job.getLong("total_bytes", -1);
+            long completed = job.getLong("completed_bytes", 0);
+            if (total > 0) {
+                System.out.printf("\rDownloading... %d%%", completed * 100 / total);
+            } else {
+                System.out.print("\rDownloading...");
+            }
+            try {
+                Thread.sleep(400);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+    }
+
+    private int interactiveLoop(EnrClient client, String model, Integer maxTokens, Float temperature,
+                                String initialPrompt, boolean multi) {
         List<JsonObject> messages = new ArrayList<>();
         if (initialPrompt != null) {
             messages.add(chatMessage("user", initialPrompt));
         }
-        System.out.println("Chat with " + model + " (Ctrl+D or /exit to quit)");
         try (java.io.BufferedReader console = new java.io.BufferedReader(
                 new java.io.InputStreamReader(System.in))) {
             while (true) {
                 String prompt = initialPrompt;
                 initialPrompt = null;
                 if (prompt == null) {
-                    System.out.print("> ");
+                    System.out.print(">>> ");
                     prompt = console.readLine();
                     if (prompt == null || "/exit".equals(prompt.strip())) {
                         System.out.println("Bye.");
@@ -948,15 +1135,23 @@ public final class EnrCli {
 
                 Models:
                   enr list                                             installed models
-                  enr pull <NAME[:TAG] | hf:REPO/FILE.gguf> [--no-stream]
-                  enr remove <modelId>
+                  enr ps                                               loaded models
+                  enr show <model>                                     model information
+                  enr pull <NAME[:TAG] | hf.co/OWNER/REPO:QUANT | hf:OWNER/REPO/FILE.gguf>
+                  enr remove <modelId>       (alias: enr rm <modelId>)
+                  enr copy <source> <destination>
                   enr import <path.gguf> [--id modelId]
                   enr load <path> [--backend cpu|cuda]
                   enr unload <modelId> [--force]
+                  enr stop <modelId>                                  unload a model
                   enr infer <modelId> "<prompt>" [--max-tokens N] [--temperature F] [--stream]
 
                 Chat:
                   enr chat <model> ["prompt"] [--max-tokens N] [--temperature F] [--multi]
+                  enr run <model> ["prompt"] [--max-tokens N] [--temperature F]   (auto-pulls if missing)
+
+                Other:
+                  enr version                                         runtime version
 
                 Providers:
                   enr provider list

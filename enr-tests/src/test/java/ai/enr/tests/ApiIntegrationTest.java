@@ -79,6 +79,13 @@ class ApiIntegrationTest {
     }
 
     @Test
+    void unloadModelNotLoadedFails() {
+        var ex = assertThrows(EnrClient.EnrException.class,
+                () -> client.unloadModel("nope", false));
+        assertEquals(404, ex.status());
+    }
+
+    @Test
     void inferenceEndpointProducesText() {
         client.loadModel(MODELS.resolve("tiny-evo.gguf").toString(), "cpu");
         var result = client.infer("tiny-evo", "token_4 token_5 token_6");

@@ -80,8 +80,10 @@ public final class EnrServer implements AutoCloseable {
         server.createContext("/api/show", OllamaApiHandlers.show(manager));
         server.createContext("/api/pull", OllamaApiHandlers.pull(manager));
         server.createContext("/api/delete", OllamaApiHandlers.delete(manager));
+        server.createContext("/api/copy", OllamaApiHandlers.copy(manager));
         server.createContext("/api/chat", OllamaApiHandlers.chat(manager));
         server.createContext("/api/generate", OllamaApiHandlers.generate(manager));
+        server.createContext("/api/embed", OllamaApiHandlers.embed(manager));
         server.createContext("/api/ps", OllamaApiHandlers.ps(manager));
         server.createContext("/api/version", OllamaApiHandlers.version(manager));
 
@@ -96,6 +98,8 @@ public final class EnrServer implements AutoCloseable {
         server.createContext("/api/v1/catalog/models/", ManagerApiHandlers.catalogModelRoute(manager));
         server.createContext("/api/v1/catalog/search", ManagerApiHandlers.catalogSearch(manager));
         server.createContext("/api/v1/catalog/pull", ManagerApiHandlers.catalogPull(manager));
+        server.createContext("/api/v1/catalog/ensure", ManagerApiHandlers.catalogEnsure(manager));
+        server.createContext("/api/v1/catalog/copy", ManagerApiHandlers.catalogCopy(manager));
         server.createContext("/api/v1/catalog/import", ManagerApiHandlers.catalogImport(manager));
         server.createContext("/api/v1/catalog/verify", ManagerApiHandlers.catalogVerify(manager));
         server.createContext("/api/v1/models/start", ManagerApiHandlers.modelStart(manager));

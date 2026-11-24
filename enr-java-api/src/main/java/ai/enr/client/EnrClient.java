@@ -120,7 +120,7 @@ public final class EnrClient implements AutoCloseable {
         JsonObject req = new JsonObject();
         req.put("id", id);
         req.put("force", force);
-        request("POST", "/api/v1/models/unload", req);
+        asObject(request("POST", "/api/v1/models/unload", req));
     }
 
     public InferenceResult infer(String model, String prompt) {
@@ -172,7 +172,7 @@ public final class EnrClient implements AutoCloseable {
         if (sessionId != null) {
             req.put("session_id", sessionId);
         }
-        request("POST", "/api/v1/inference/cancel", req);
+        asObject(request("POST", "/api/v1/inference/cancel", req));
     }
 
     public List<JsonObject> sessions() {

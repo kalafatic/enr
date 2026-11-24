@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 
 /**
@@ -210,6 +211,98 @@ final class MockServers {
         return server;
     }
 
+    /**
+     * An OpenAI-compatible provider that always answers chat/completions with
+     * a fixed HTTP status and an error body, for provider-error-propagation
+     * tests (rate limiting, auth failure, timeout, unavailability).
+     */
+    static HttpServer statusProvider(String apiKey, int status) throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String auth = exchange.getRequestHeaders().getFirst("Authorization");
+            String expected = "Bearer " + apiKey;
+            if (!expected.equals(auth)) {
+                send(exchange, 401, "{\"error\":{\"message\":\"invalid api key\"}}", "application/json");
+                return;
+            }
+            if ("/v1/chat/completions".equals(path)) {
+                send(exchange, status,
+                        "{\"error\":{\"message\":\"upstream failure\",\"type\":\"mock\"}}", "application/json");
+                return;
+            }
+            send(exchange, 404, "{\"error\":{\"message\":\"not found\"}}", "application/json");
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+        return server;
+    }
+
+    /**
+     * A minimal Hugging Face API server. Serves {@code /api/models/<repo>/tree/main}
+     * listing the given GGUF file paths (plus lfs metadata), and streams model
+     * bytes from {@code /<repo>/resolve/main/<file>} with Range support.
+     */
+    static HttpServer huggingFaceServer(List<String> ggufPaths, Map<String, byte[]> fileBytes,
+                                        java.util.concurrent.atomic.AtomicReference<String> lastAuth)
+            throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 8);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if (lastAuth != null) {
+                lastAuth.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            }
+            if (path.startsWith("/api/models/") && path.endsWith("/tree/main")) {
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                for (String file : ggufPaths) {
+                    byte[] bytes = fileBytes.getOrDefault(file, new byte[0]);
+                    if (!first) {
+                        sb.append(',');
+                    }
+                    first = false;
+                    sb.append("{\"type\":\"file\",\"path\":\"").append(file)
+                            .append("\",\"size\":").append(bytes.length)
+                            .append(",\"lfs\":{\"oid\":\"").append(ai.enr.core.io.Hashing.sha256Hex(bytes))
+                            .append("\",\"size\":").append(bytes.length).append("}}");
+                }
+                sb.append(']');
+                send(exchange, 200, sb.toString(), "application/json");
+                return;
+            }
+            if (path.contains("/resolve/main/")) {
+                String file = path.substring(path.indexOf("/resolve/main/") + "/resolve/main/".length());
+                byte[] bytes = fileBytes.get(file);
+                if (bytes == null) {
+                    send(exchange, 404, "{\"error\":\"not found\"}", "application/json");
+                    return;
+                }
+                String range = exchange.getRequestHeaders().getFirst("Range");
+                if (range != null && range.startsWith("bytes=")) {
+                    long start = Long.parseLong(range.substring(6).split("-")[0]);
+                    byte[] part = java.util.Arrays.copyOfRange(bytes, (int) start, bytes.length);
+                    exchange.getResponseHeaders().set("Content-Range",
+                            "bytes " + start + "-" + (bytes.length - 1) + "/" + bytes.length);
+                    exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
+                    exchange.sendResponseHeaders(206, part.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(part);
+                    }
+                } else {
+                    exchange.getResponseHeaders().set("Content-Type", "application/octet-stream");
+                    exchange.sendResponseHeaders(200, bytes.length);
+                    try (OutputStream out = exchange.getResponseBody()) {
+                        out.write(bytes);
+                    }
+                }
+                return;
+            }
+            send(exchange, 404, "{\"error\":\"not found\"}", "application/json");
+        });
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+        server.start();
+        return server;
+    }
     /**
      * Configurable mock Ollama API server (/api/tags, /api/show, /api/pull
      * NDJSON stream, /api/delete, /api/version) for model management tests.

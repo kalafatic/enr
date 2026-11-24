@@ -2,6 +2,7 @@ package ai.enr.tests;
 
 import ai.enr.client.EnrClient;
 import ai.enr.core.json.Json;
+import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
 import ai.enr.manager.EnrConfig;
 import ai.enr.manager.EnrManager;
@@ -152,6 +153,54 @@ class OllamaCompatibilityTest extends ManagerTestBase {
     void deleteUnknownModelReturns404() throws Exception {
         HttpResponse<String> response = delete("/api/delete", "{\"name\":\"nope\"}");
         assertEquals(404, response.statusCode());
+    }
+
+    @Test
+    void copyModelCreatesNewIdentifier() throws Exception {
+        importTinyEvo("tiny-evo");
+        HttpResponse<String> response = post("/api/copy",
+                "{\"source\":\"tiny-evo\",\"destination\":\"tiny-evo-copy\"}");
+        assertEquals(200, response.statusCode(), response.body());
+        JsonObject tags = json(get("/api/tags"));
+        var models = tags.getArray("models");
+        assertEquals(2, models.size());
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < models.size(); i++) {
+            names.add(models.getObject(i).getString("name", ""));
+        }
+        assertTrue(names.contains("tiny-evo"));
+        assertTrue(names.contains("tiny-evo-copy"));
+    }
+
+    @Test
+    void copyMissingSourceReturns404() throws Exception {
+        HttpResponse<String> response = post("/api/copy",
+                "{\"source\":\"nope\",\"destination\":\"x\"}");
+        assertEquals(404, response.statusCode());
+    }
+
+    @Test
+    void embedOnLocalModelReturns501() throws Exception {
+        importTinyEvo("tiny-evo");
+        HttpResponse<String> response = post("/api/embed",
+                "{\"model\":\"tiny-evo\",\"input\":\"hello\"}");
+        assertEquals(501, response.statusCode(), response.body());
+    }
+
+    @Test
+    void embedViaProviderReturnsEmbeddings() throws Exception {
+        HttpServer provider = MockServers.openAiProvider("sk-test-key", List.of("mock-model"));
+        try {
+            manager.addProvider("mock", "openai-compatible", "Mock",
+                    "http://127.0.0.1:" + provider.getAddress().getPort() + "/v1", "sk-test-key", true);
+            JsonObject body = json(post("/api/embed", "{\"model\":\"mock:mock-model\",\"input\":\"hello\"}"));
+            JsonArray embeddings = body.getArray("embeddings");
+            assertNotNull(embeddings);
+            assertEquals(1, embeddings.size());
+            assertEquals(1, body.getInt("prompt_eval_count", 0));
+        } finally {
+            provider.stop(0);
+        }
     }
 
     // ------------------------------------------------------------ helpers

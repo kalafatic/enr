@@ -2,6 +2,7 @@ package ai.enr.server;
 
 import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonObject;
+import ai.enr.core.json.JsonParseException;
 import ai.enr.manager.EnrManager;
 import ai.enr.manager.provider.ChatMessage;
 import com.sun.net.httpserver.HttpExchange;
@@ -74,6 +75,66 @@ final class ManagerApiHandlers {
             } catch (Exception e) {
                 HttpSupport.sendError(exchange, 422, "PULL_FAILED", e.getMessage() == null
                         ? e.getClass().getSimpleName() : e.getMessage());
+            }
+        };
+    }
+
+    static HttpHandler catalogEnsure(EnrManager manager) {
+        return exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                return;
+            }
+            if (!authorize(exchange, manager)) {
+                return;
+            }
+            JsonObject request = HttpSupport.parseBodyObject(exchange);
+            String ref = request.getString("name", request.getString("ref", ""));
+            if (ref.isBlank()) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'name' field");
+                return;
+            }
+            try {
+                HttpSupport.sendJson(exchange, 200, manager.ensureAvailable(ref));
+            } catch (Exception e) {
+                HttpSupport.sendError(exchange, 422, "ENSURE_FAILED", e.getMessage() == null
+                        ? e.getClass().getSimpleName() : e.getMessage());
+            }
+        };
+    }
+
+    static HttpHandler catalogCopy(EnrManager manager) {
+        return exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                HttpSupport.sendError(exchange, 405, "METHOD_NOT_ALLOWED", "Only POST allowed");
+                return;
+            }
+            if (!authorize(exchange, manager)) {
+                return;
+            }
+            JsonObject request = HttpSupport.parseBodyObject(exchange);
+            String source = request.getString("source", "");
+            String destination = request.getString("destination", "");
+            if (source.isBlank()) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'source' field");
+                return;
+            }
+            if (destination.isBlank()) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", "Missing 'destination' field");
+                return;
+            }
+            try {
+                manager.copyModel(source, destination);
+                JsonObject response = new JsonObject();
+                response.put("source", source);
+                response.put("destination", destination);
+                HttpSupport.sendJson(exchange, 200, response);
+            } catch (IllegalArgumentException e) {
+                HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
+            } catch (IllegalStateException e) {
+                HttpSupport.sendError(exchange, 409, "MODEL_EXISTS", e.getMessage());
+            } catch (Exception e) {
+                HttpSupport.sendError(exchange, 500, "COPY_FAILED", e.getMessage());
             }
         };
     }
@@ -346,7 +407,9 @@ final class ManagerApiHandlers {
                 manager.validateTools(model, options);
                 if (!stream) {
                     JsonObject response = manager.chat(model, messages, options);
-                    HttpSupport.sendJson(exchange, response.has("error") ? 500 : 200, response);
+                    HttpSupport.sendJson(exchange, response.has("error")
+                            ? (response.has("error_status") ? response.getInt("error_status", 502) : 502)
+                            : 200, response);
                     return;
                 }
                 exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
@@ -364,6 +427,8 @@ final class ManagerApiHandlers {
                     // client disconnected
                 }
             } catch (EnrManager.ToolCallingUnsupportedException e) {
+                HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
+            } catch (JsonParseException e) {
                 HttpSupport.sendError(exchange, 400, "INVALID_REQUEST", e.getMessage());
             } catch (IllegalArgumentException e) {
                 HttpSupport.sendError(exchange, 404, "MODEL_NOT_FOUND", e.getMessage());
