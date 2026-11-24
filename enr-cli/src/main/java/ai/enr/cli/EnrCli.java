@@ -51,20 +51,18 @@ public final class EnrCli {
 
     private int run(String[] args) {
         if (args.length == 0) {
-            printUsage();
-            return 1;
+            return launchMenu();
         }
         String command = args[0];
         String[] rest = java.util.Arrays.copyOfRange(args, 1, args.length);
         try {
             return switch (command) {
                 case "serve" -> serve(rest, false);
-                case "start" -> serve(rest, true);
+                case "start" -> start(rest);
                 case "stop" -> stop(rest);
-                case "status" -> client(rest).map(c -> {
-                    System.out.println(Json.write(c.status(), true));
-                    return 0;
-                }).orElse(1);
+                case "restart" -> restart(rest);
+                case "status" -> status(rest);
+                case "logs" -> logs(rest);
                 case "models" -> modelsCommand(rest);
                 case "list" -> list(rest);
                 case "ps" -> ps(rest);
@@ -100,6 +98,83 @@ public final class EnrCli {
     }
 
     // ------------------------------------------------------------ server
+
+    /**
+     * Interactive first-launch menu shown when the JAR is run with no arguments
+     * (double-click / {@code java -jar enr.jar}). Defaults to option 1 on a
+     * blank line. When stdin is not a terminal the usage text is printed instead.
+     */
+    private int launchMenu() {
+        if (System.console() == null) {
+            printUsage();
+            return 1;
+        }
+        System.out.println("ENR - EVO Native Runtime");
+        System.out.println();
+        System.out.println("Welcome! Choose how to run ENR:");
+        System.out.println();
+        System.out.println("[1] Install as system service");
+        System.out.println("    Permanent installation, automatic OS startup.");
+        System.out.println();
+        System.out.println("[2] Run directly in this terminal");
+        System.out.println("    No installation, no administrator privileges.");
+        System.out.println();
+        System.out.println("[0] Exit");
+        System.out.println();
+        String line = System.console().readLine("Selection [1]: ");
+        String choice = line == null ? "" : line.strip();
+        if (choice.isEmpty()) {
+            choice = "1";
+        }
+        return switch (choice) {
+            case "1" -> installServiceInteractive();
+            case "2" -> {
+                try {
+                    yield serve(new String[0], false);
+                } catch (Exception e) {
+                    System.err.println("ERROR: " + e.getMessage());
+                    yield 1;
+                }
+            }
+            case "0" -> 0;
+            default -> {
+                System.out.println("Invalid selection: " + choice);
+                yield 1;
+            }
+        };
+    }
+
+    /** Installs ENR as a service (menu option 1), then starts and verifies it. */
+    private int installServiceInteractive() {
+        try {
+            Path jar = currentJarPath();
+            if (jar == null) {
+                System.err.println("Could not determine the ENR JAR path.");
+                return 1;
+            }
+            System.out.println("Installing ENR as a service...");
+            ServiceManager.install(jar, "127.0.0.1", 8111);
+            return 0;
+        } catch (Exception e) {
+            System.err.println("Installation failed: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    /** Resolves the running JAR path (for {@code java -jar enr.jar}). */
+    private static Path currentJarPath() {
+        String cp = System.getProperty("java.class.path", "");
+        if (cp != null && cp.endsWith(".jar") && Files.exists(Path.of(cp))) {
+            return Path.of(cp).toAbsolutePath();
+        }
+        String cmd = ProcessHandle.current().info().commandLine().orElse("");
+        for (String token : cmd.split(" ")) {
+            if (token.endsWith(".jar") && Files.exists(Path.of(token))) {
+                return Path.of(token).toAbsolutePath();
+            }
+        }
+        return SystemdSupport.defaultJarPath();
+    }
 
     /** enr models [providers|installed <p>|available <p>|pull <p> <m>|status <job>|cancel <job>|remove <p> <m>] */
     private int modelsCommand(String[] args) {
@@ -371,6 +446,16 @@ public final class EnrCli {
             System.out.println("Stopped model: " + args[0]);
             return 0;
         }
+        if (ServiceManager.installed()) {
+            try {
+                ServiceManager.stop();
+                System.out.println("ENR service stopped.");
+                return 0;
+            } catch (IOException e) {
+                System.err.println("Failed to stop service: " + e.getMessage());
+                return 1;
+            }
+        }
         String pidFile = "/tmp/enr.pid";
         Path pidPath = Path.of(pidFile);
         if (Files.exists(pidPath)) {
@@ -382,6 +467,61 @@ public final class EnrCli {
         }
         System.err.println("No ENR pid file found; ENR may not be running or was started without pid tracking.");
         return 1;
+    }
+
+    private int start(String[] args) throws Exception {
+        if (ServiceManager.installed()) {
+            try {
+                ServiceManager.start();
+                System.out.println("ENR service started.");
+                return 0;
+            } catch (IOException e) {
+                System.err.println("Failed to start service: " + e.getMessage());
+                return 1;
+            }
+        }
+        return serve(args, true);
+    }
+
+    private int restart(String[] args) {
+        if (!ServiceManager.installed()) {
+            System.err.println("ENR is not installed as a service. Run 'enr service install' first.");
+            return 1;
+        }
+        try {
+            ServiceManager.restart();
+            System.out.println("ENR service restarted.");
+            return 0;
+        } catch (IOException e) {
+            System.err.println("Failed to restart service: " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private int status(String[] args) {
+        if (ServiceManager.installed()) {
+            System.out.println(ServiceManager.status());
+            return 0;
+        }
+        return client(args).map(c -> {
+            System.out.println(Json.write(c.status(), true));
+            return 0;
+        }).orElse(1);
+    }
+
+    private int logs(String[] args) {
+        if (!ServiceManager.installed()) {
+            System.err.println("ENR is not installed as a service. Run 'enr service install' first.");
+            return 1;
+        }
+        int lines = 100;
+        for (int i = 0; i < args.length; i++) {
+            if ("-n".equals(args[i]) || "--lines".equals(args[i])) {
+                lines = Integer.parseInt(args[++i]);
+            }
+        }
+        System.out.println(ServiceManager.logs(lines));
+        return 0;
     }
 
     // ------------------------------------------------------------ model management
@@ -924,36 +1064,24 @@ public final class EnrCli {
 
     private int service(String[] args) throws IOException {
         if (args.length == 0) {
-            System.err.println("Usage: enr service install|uninstall|status|unit [--config PATH] [--jar PATH] [--user U] [--group G]");
+            System.err.println("Usage: enr service install|uninstall|status|logs|unit [--jar PATH]");
             return 1;
         }
-        Path configPath = Path.of("/etc/enr/enr.yaml");
-        Path jarPath = SystemdSupport.defaultJarPath();
-        String user = System.getProperty("user.name", "root");
-        String group = user;
-        boolean userExplicit = false;
-        String logDir = "/var/log/enr";
+        Path jarPath = currentJarPath();
         for (int i = 1; i < args.length; i++) {
-            switch (args[i]) {
-                case "--config" -> configPath = Path.of(args[++i]);
-                case "--jar" -> jarPath = Path.of(args[++i]);
-                case "--user" -> {
-                    user = args[++i];
-                    userExplicit = true;
-                }
-                case "--group" -> group = args[++i];
-                case "--log-dir" -> logDir = args[++i];
-                default -> throw new IllegalArgumentException("Unknown service option: " + args[i]);
+            if ("--jar".equals(args[i])) {
+                jarPath = Path.of(args[++i]);
             }
-        }
-        if (userExplicit && java.util.Arrays.stream(args).noneMatch("--group"::equals)) {
-            group = user;
         }
         return switch (args[0]) {
             case "unit" -> {
-                Path java = SystemdSupport.currentJavaBinary();
-                System.out.println(SystemdSupport.unitFile(java.toString(), jarPath.toString(),
-                        configPath.toString(), user, group, logDir));
+                String java = SystemdSupport.currentJavaBinary().toString();
+                String logDir = Path.of(System.getProperty("user.home"), ".enr", "logs").toString();
+                System.out.println(ServiceManager.detectScope() == ServiceManager.Scope.SYSTEM
+                        ? SystemdSupport.unitFile(java, jarPath.toString(),
+                                Path.of(System.getProperty("user.home"), ".enr", "enr.yaml").toString(),
+                                System.getProperty("user.name"), System.getProperty("user.name"), logDir)
+                        : SystemdSupport.unitFileUser(java, jarPath.toString(), logDir));
                 yield 0;
             }
             case "install" -> {
@@ -961,28 +1089,24 @@ public final class EnrCli {
                     System.err.println("JAR not found: " + jarPath + " (run mvn package first, or pass --jar)");
                     yield 1;
                 }
-                for (String problem : SystemdSupport.checkEnvironment()) {
-                    System.err.println("WARNING: " + problem);
-                }
-                Path modelsDir = Path.of("/var/lib/enr/models");
-                SystemdSupport.ensureSystemConfig(configPath, modelsDir, Path.of(logDir));
-                SystemdSupport.install(SystemdSupport.currentJavaBinary(), jarPath, configPath,
-                        user, group, Path.of(logDir));
-                System.out.println("Installed " + SystemdSupport.UNIT_NAME);
-                System.out.println("  config:   " + configPath);
-                System.out.println("  models:   " + modelsDir);
-                System.out.println("  logs:     " + logDir);
-                System.out.println("Run 'systemctl start enr' to start the service, "
-                        + "'systemctl enable enr' already ran.");
+                ServiceManager.install(jarPath, "127.0.0.1", 8111);
                 yield 0;
             }
             case "uninstall" -> {
-                SystemdSupport.uninstall();
-                System.out.println("Removed " + SystemdSupport.UNIT_NAME);
+                ServiceManager.uninstall();
                 yield 0;
             }
             case "status" -> {
-                System.out.println(SystemdSupport.status());
+                System.out.println(ServiceManager.installed()
+                        ? ServiceManager.status() : "ENR service is not installed.");
+                yield 0;
+            }
+            case "logs" -> {
+                if (!ServiceManager.installed()) {
+                    System.err.println("ENR service is not installed.");
+                    yield 1;
+                }
+                System.out.println(ServiceManager.logs(100));
                 yield 0;
             }
             default -> {
@@ -1129,9 +1253,11 @@ public final class EnrCli {
 
                 Server:
                   enr serve [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]    foreground server
-                  enr start [same options]                                          server with pid file
-                  enr stop
+                  enr start [same options]                                          start (service, else pid file)
+                  enr stop                                                          stop service / server
+                  enr restart                                                       restart the service
                   enr status | devices | diagnostics
+                  enr logs [-n N]                                                  service logs (journalctl)
 
                 Models:
                   enr list                                             installed models
@@ -1161,10 +1287,11 @@ public final class EnrCli {
                   enr provider models <id>
 
                 System service:
-                  enr service unit [--config PATH] [--jar PATH] [--user U]
-                  enr service install [--config PATH] [--jar PATH] [--user U]
+                  enr service install [--jar PATH]                                  install + start + verify
                   enr service uninstall
                   enr service status
+                  enr service logs
+                  enr service unit [--jar PATH]                                     print the unit file
                 """);
     }
 

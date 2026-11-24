@@ -159,4 +159,116 @@ public final class SystemdSupport {
     public static Path currentJavaBinary() {
         return Path.of(System.getProperty("java.home"), "bin", "java").toAbsolutePath();
     }
+
+    // ------------------------------------------------------------ user-level (systemctl --user)
+
+    public static final String USER_UNIT_DIR =
+            Path.of(System.getProperty("user.home"), ".config", "systemd", "user").toString();
+
+    /**
+     * User-level unit (no root). Uses the user's own data directory (~/.enr)
+     * so a user-level service and direct terminal mode share the same model
+     * registry, configuration and storage.
+     */
+    public static String unitFileUser(String javaBinary, String jarPath, String logDir) {
+        return """
+                [Unit]
+                Description=ENR Server — Native AI Model Inference Runtime & Web Control Center
+                After=network-online.target
+                Wants=network-online.target
+
+                [Service]
+                Type=simple
+                ExecStart=%s --enable-native-access=ALL-UNNAMED -jar %s serve
+                Restart=on-failure
+                RestartSec=5
+                TimeoutStopSec=60
+                KillSignal=SIGTERM
+                SuccessExitStatus=143
+                LimitNOFILE=65536
+                StandardOutput=append:%s/enr-server.out.log
+                StandardError=append:%s/enr-server.err.log
+
+                [Install]
+                WantedBy=default.target
+                """.formatted(javaBinary, jarPath, logDir, logDir);
+    }
+
+    public static void installUser(Path javaBinary, Path jarPath, Path logDir) throws IOException {
+        Files.createDirectories(Path.of(USER_UNIT_DIR));
+        Files.writeString(Path.of(USER_UNIT_DIR, UNIT_NAME),
+                unitFileUser(javaBinary.toAbsolutePath().toString(),
+                        jarPath.toAbsolutePath().toString(),
+                        logDir.toAbsolutePath().toString()));
+        run("systemctl", "--user", "daemon-reload");
+        run("systemctl", "--user", "enable", UNIT_NAME);
+    }
+
+    public static boolean installedUser() {
+        return Files.exists(Path.of(USER_UNIT_DIR, UNIT_NAME));
+    }
+
+    public static void uninstallUser() throws IOException {
+        run("systemctl", "--user", "disable", "--now", UNIT_NAME);
+        Files.deleteIfExists(Path.of(USER_UNIT_DIR, UNIT_NAME));
+        run("systemctl", "--user", "daemon-reload");
+    }
+
+    // ------------------------------------------------------------ service control (system + user)
+
+    public static void startSystem() throws IOException {
+        runChecked("systemctl", "start", UNIT_NAME);
+    }
+
+    public static void startUser() throws IOException {
+        runChecked("systemctl", "--user", "start", UNIT_NAME);
+    }
+
+    public static void stopSystem() throws IOException {
+        runChecked("systemctl", "stop", UNIT_NAME);
+    }
+
+    public static void stopUser() throws IOException {
+        runChecked("systemctl", "--user", "stop", UNIT_NAME);
+    }
+
+    public static void restartSystem() throws IOException {
+        runChecked("systemctl", "restart", UNIT_NAME);
+    }
+
+    public static void restartUser() throws IOException {
+        runChecked("systemctl", "--user", "restart", UNIT_NAME);
+    }
+
+    public static String statusSystem() {
+        return capture("systemctl", "status", UNIT_NAME, "--no-pager");
+    }
+
+    public static String statusUser() {
+        return capture("systemctl", "--user", "status", UNIT_NAME, "--no-pager");
+    }
+
+    public static String logsSystem(int lines) {
+        return capture("journalctl", "-u", UNIT_NAME, "-n", String.valueOf(lines), "--no-pager");
+    }
+
+    public static String logsUser(int lines) {
+        return capture("journalctl", "--user", "-u", UNIT_NAME, "-n", String.valueOf(lines), "--no-pager");
+    }
+
+    /** Runs a command and throws on a non-zero exit, returning the combined output. */
+    private static void runChecked(String... command) throws IOException {
+        try {
+            Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            String output = new String(process.getInputStream().readAllBytes());
+            int exit = process.waitFor();
+            if (exit != 0) {
+                throw new IOException(String.join(" ", command) + " exited " + exit
+                        + (output.isBlank() ? "" : ": " + output.strip()));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while running " + String.join(" ", command), e);
+        }
+    }
 }
