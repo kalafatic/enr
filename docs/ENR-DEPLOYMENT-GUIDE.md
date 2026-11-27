@@ -31,7 +31,7 @@ runtime:
   session_idle_timeout_seconds: 1800
 server:
   host: 127.0.0.1
-  port: 8111
+  port: 28780
 ```
 
 All keys optional; defaults shown above.

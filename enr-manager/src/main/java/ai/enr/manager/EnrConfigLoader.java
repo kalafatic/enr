@@ -61,6 +61,9 @@ public final class EnrConfigLoader {
             builder.huggingFaceApiUrl(catalogs.getString("huggingface_api", "https://huggingface.co"));
             builder.huggingFaceToken(resolveHfToken(catalogs.getString("huggingface_token", "")));
             builder.downloadTimeoutMs(catalogs.getLong("download_timeout_ms", 0));
+            if (catalogs.has("ollama_models_dir")) {
+                builder.ollamaModelsDir(expandHome(catalogs.getString("ollama_models_dir")));
+            }
         }
         JsonObject modelProviders = config.getObject("model_providers");
         if (modelProviders != null) {
@@ -70,6 +73,7 @@ public final class EnrConfigLoader {
         if (webServer != null) {
             builder.webUiEnabled(webServer.getBoolean("enabled", true));
             builder.webUiAutoStart(webServer.getBoolean("auto_start", true));
+            builder.webPort(webServer.getInt("port", EnrConfig.DEFAULT_WEB_PORT));
         }
         return builder.build();
     }

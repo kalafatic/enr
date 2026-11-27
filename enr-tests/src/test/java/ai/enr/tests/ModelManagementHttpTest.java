@@ -50,6 +50,7 @@ class ModelManagementHttpTest {
                 .dataDir(tempDir.resolve("data"))
                 .modelsDir(tempDir.resolve("models"))
                 .logDir(tempDir.resolve("logs"))
+                .ollamaModelsDir(tempDir.resolve("ollama-models"))
                 .modelProviders(providers)
                 .build();
         manager = new EnrManager(config);

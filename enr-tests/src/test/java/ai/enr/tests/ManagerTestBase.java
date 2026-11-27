@@ -36,6 +36,7 @@ abstract class ManagerTestBase {
                 .dataDir(tempDir.resolve("data"))
                 .modelsDir(tempDir.resolve("models"))
                 .logDir(tempDir.resolve("logs"))
+                .ollamaModelsDir(tempDir.resolve("ollama-models"))
                 .defaultMaxTokens(16)
                 .maxConcurrentSessions(16)
                 .build();

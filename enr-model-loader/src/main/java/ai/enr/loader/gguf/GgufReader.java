@@ -1,5 +1,6 @@
 package ai.enr.loader.gguf;
 
+import ai.enr.core.gguf.GgufQuant;
 import ai.enr.core.io.EndianIO;
 import ai.enr.core.tensor.DType;
 import ai.enr.loader.api.Architecture;
@@ -7,6 +8,7 @@ import ai.enr.loader.api.LoadedModel;
 import ai.enr.loader.api.LoadException;
 import ai.enr.loader.api.ModelFormat;
 import ai.enr.loader.api.TensorEntry;
+import ai.enr.loader.api.TensorStore;
 import ai.enr.loader.api.TensorStores;
 import ai.enr.loader.api.TokenizerInfo;
 
@@ -31,9 +33,6 @@ import java.util.Map;
  *   - 1D norm weights: as-is
  */
 public final class GgufReader {
-
-    private static final int GGML_TYPE_F32 = 0;
-    private static final int GGML_TYPE_F16 = 1;
 
     public LoadedModel read(Path path, boolean verifyChecksums) throws LoadException {
         try (InputStream fis = Files.newInputStream(path);
@@ -91,6 +90,7 @@ public final class GgufReader {
 
             long alignment = kvLong(kv, "general.alignment", 32);
             long tensorDataSectionStart = alignUp(in.position(), alignment);
+            long fileSize = Files.size(path);
 
             List<TensorEntry> tensors = new ArrayList<>();
             for (int i = 0; i < infos.size(); i++) {
@@ -99,19 +99,24 @@ public final class GgufReader {
                 for (long d : info.dims) {
                     elementCount *= d;
                 }
+                int ggmlType = info.ggmlType;
                 DType dtype;
-                if (info.ggmlType == GGML_TYPE_F32) {
+                long uncompressedSize;
+                long compressedSize;
+                if (ggmlType == GgufQuant.GGML_TYPE_F32) {
                     dtype = DType.F32;
-                } else if (info.ggmlType == GGML_TYPE_F16) {
-                    dtype = DType.F16;
+                    uncompressedSize = elementCount * 4L;
+                    compressedSize = uncompressedSize;
+                } else if (GgufQuant.isSupported(ggmlType)) {
+                    // Half-precision or block-quantized tensor: dequantized lazily to F32.
+                    dtype = DType.F32;
+                    uncompressedSize = elementCount * 4L;
+                    compressedSize = GgufQuant.rowSizeBytes(ggmlType, elementCount);
                 } else {
-                    throw new LoadException("Tensor " + info.name + " uses GGML type " + info.ggmlType
-                            + " (quantized). The ENR native runtime currently supports F32 and F16 tensors "
-                            + "only; quantized models such as Q4_K_M cannot be executed natively yet. "
-                            + "Use an F16/F32 export (e.g. Darwin Forge) or a cloud provider for this model.");
+                    throw new LoadException("Tensor " + info.name + " uses unsupported GGML type " + ggmlType);
                 }
                 long dataOffset = tensorDataSectionStart + info.offset;
-                if (dataOffset < 0 || dataOffset >= Files.size(path)) {
+                if (dataOffset < 0 || dataOffset >= fileSize) {
                     throw new LoadException("GGUF tensor " + info.name + " has invalid data offset " + dataOffset);
                 }
 
@@ -119,23 +124,29 @@ public final class GgufReader {
                 long[] canonicalShape = canonicalShape(info.name, info.dims);
                 boolean transpose = needsTranspose(info.name, info.dims);
 
-                TensorStores.DTypeLe storeDtype = dtype == DType.F32
-                        ? TensorStores.DTypeLe.F32
-                        : null;
-                if (storeDtype == null) {
-                    throw new LoadException("Tensor " + info.name + " uses unsupported dtype " + dtype
-                            + " for memory-mapped loading");
-                }
-                var store = TensorStores.mmapLittleEndian(path, dataOffset, elementCount, storeDtype);
-                if (transpose) {
-                    store = TensorStores.transpose(store, info.dims[1], info.dims[0]);
+                TensorStore store;
+                if (ggmlType == GgufQuant.GGML_TYPE_F32) {
+                    store = TensorStores.mmapLittleEndian(path, dataOffset, elementCount,
+                            TensorStores.DTypeLe.F32);
+                    if (transpose) {
+                        store = TensorStores.transpose(store, info.dims[1], info.dims[0]);
+                    }
+                } else if (info.dims.length == 2) {
+                    // Quantized 2D weight: keep packed, laid out [dims[1]][dims[0]]
+                    // (output-major), consumed directly by the quantized matmul.
+                    store = TensorStores.quantized(path, dataOffset, ggmlType, elementCount,
+                            (int) info.dims[1], (int) info.dims[0], transpose);
+                } else {
+                    final int type = ggmlType;
+                    final long offset = dataOffset;
+                    final long count = elementCount;
+                    store = TensorStores.lazy(() -> GgufQuant.readAndDequantize(path, offset, type, count));
                 }
                 TensorEntry entry = new TensorEntry(i, canonicalName, dtype, canonicalShape, 0,
-                        dataOffset, elementCount * dtype.elementBytes(), elementCount * dtype.elementBytes(),
-                        0, "", store);
+                        dataOffset, compressedSize, uncompressedSize, 0, "", store);
                 tensors.add(entry);
 
-                if (verifyChecksums && dtype == DType.F32) {
+                if (verifyChecksums && ggmlType == GgufQuant.GGML_TYPE_F32) {
                     entry.loadFloats();
                 }
             }

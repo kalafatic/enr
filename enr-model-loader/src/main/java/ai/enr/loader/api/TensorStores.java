@@ -1,7 +1,9 @@
 package ai.enr.loader.api;
 
+import ai.enr.core.gguf.GgufQuant;
 import ai.enr.core.io.EndianIO;
 import ai.enr.core.io.Hex;
+import ai.enr.core.tensor.QuantizedWeight;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -22,12 +24,34 @@ public final class TensorStores {
         return new EagerStore(data);
     }
 
+    /**
+     * Lazily materialized store backed by a supplier. The supplier is invoked at
+     * most once, on the first {@link TensorStore#loadFloats()} call, and the result
+     * is cached. Used for dequantized GGUF tensors, mirroring the lazy behaviour of
+     * the memory-mapped F32 store.
+     */
+    public static TensorStore lazy(java.util.function.Supplier<float[]> loader) {
+        return new LazyStore(loader);
+    }
+
     public static TensorStore gzip(byte[] compressed, long uncompressedSize) {
         return new GzipStore(compressed, (int) uncompressedSize);
     }
 
     public static TensorStore mmapLittleEndian(Path file, long dataOffset, long elementCount, DTypeLe dtype) {
         return new MmapLeStore(file, dataOffset, elementCount, dtype);
+    }
+
+    /**
+     * A store that keeps a quantized GGUF tensor in its original packed form and
+     * exposes it as a {@link QuantizedWeight} for block-wise computation. The
+     * weight is laid out {@code [rows][cols]} (output-major). {@link TensorStore#loadFloats()}
+     * performs a full dequantization in the canonical (transposed, if requested)
+     * layout, matching the F32 path.
+     */
+    public static TensorStore quantized(Path file, long dataOffset, int ggmlType, long elementCount,
+                                        int rows, int cols, boolean transpose) {
+        return new QuantStore(file, dataOffset, ggmlType, elementCount, rows, cols, transpose);
     }
 
     public static TensorStore transpose(TensorStore source, long rows, long cols) {
@@ -47,6 +71,34 @@ public final class TensorStores {
         @Override
         public boolean isLoaded() {
             return true;
+        }
+    }
+
+    private static final class LazyStore implements TensorStore {
+        private final java.util.function.Supplier<float[]> loader;
+        private volatile float[] cache;
+
+        LazyStore(java.util.function.Supplier<float[]> loader) {
+            this.loader = loader;
+        }
+
+        @Override
+        public float[] loadFloats() {
+            float[] local = cache;
+            if (local != null) {
+                return local.clone();
+            }
+            synchronized (this) {
+                if (cache == null) {
+                    cache = loader.get();
+                }
+                return cache.clone();
+            }
+        }
+
+        @Override
+        public boolean isLoaded() {
+            return cache != null;
         }
     }
 
@@ -127,6 +179,63 @@ public final class TensorStores {
         @Override
         public boolean isLoaded() {
             return cache != null;
+        }
+    }
+
+    private static final class QuantStore implements TensorStore {
+        private final Path file;
+        private final long dataOffset;
+        private final int ggmlType;
+        private final long elementCount;
+        private final int rows;
+        private final int cols;
+        private final boolean transpose;
+        private volatile QuantizedWeight cached;
+
+        QuantStore(Path file, long dataOffset, int ggmlType, long elementCount, int rows, int cols,
+                   boolean transpose) {
+            this.file = file;
+            this.dataOffset = dataOffset;
+            this.ggmlType = ggmlType;
+            this.elementCount = elementCount;
+            this.rows = rows;
+            this.cols = cols;
+            this.transpose = transpose;
+        }
+
+        @Override
+        public QuantizedWeight quantizedWeight() {
+            QuantizedWeight local = cached;
+            if (local != null) {
+                return local;
+            }
+            synchronized (this) {
+                if (cached == null) {
+                    byte[] raw = GgufQuant.readRaw(file, dataOffset, ggmlType, elementCount);
+                    cached = new QuantizedWeight(ggmlType, rows, cols, raw);
+                }
+                return cached;
+            }
+        }
+
+        @Override
+        public float[] loadFloats() {
+            float[] raw = quantizedWeight().dequantize();
+            if (!transpose) {
+                return raw;
+            }
+            float[] canonical = new float[raw.length];
+            for (int c = 0; c < rows; c++) {
+                for (int j = 0; j < cols; j++) {
+                    canonical[j * rows + c] = raw[c * cols + j];
+                }
+            }
+            return canonical;
+        }
+
+        @Override
+        public boolean isLoaded() {
+            return cached != null;
         }
     }
 

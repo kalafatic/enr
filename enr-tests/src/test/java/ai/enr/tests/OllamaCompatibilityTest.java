@@ -113,6 +113,7 @@ class OllamaCompatibilityTest extends ManagerTestBase {
                     .dataDir(tempDir.resolve("data"))
                     .modelsDir(tempDir.resolve("models"))
                     .logDir(tempDir.resolve("logs"))
+                    .ollamaModelsDir(tempDir.resolve("ollama-models"))
                     .ollamaRegistryUrl("http://127.0.0.1:" + registry.getAddress().getPort())
                     .build();
             restartManager(config);

@@ -1,6 +1,7 @@
 package ai.enr.manager.store;
 
 import ai.enr.core.io.Hashing;
+import ai.enr.core.json.Json;
 import ai.enr.core.json.JsonArray;
 import ai.enr.core.json.JsonObject;
 import ai.enr.manager.EnrConfig;
@@ -68,8 +69,151 @@ public final class ModelStore {
                     file.getParent());
             models.add(new StoredModel(manifest, Files.isRegularFile(file)));
         }
+        // Ollama installation models: manifest-registered models plus any bare
+        // .gguf/.evo artifacts placed directly in the Ollama models directory.
+        // They are referenced in place (never copied) and share the same
+        // registry, so ENR and Ollama see the same model identifiers.
+        for (StoredModel ollama : discoverOllamaModels()) {
+            if (models.stream().noneMatch(m -> m.id().equals(ollama.id()))) {
+                models.add(ollama);
+            }
+        }
         models.sort(Comparator.comparing(StoredModel::id));
         return models;
+    }
+
+    /**
+     * Discovers the models installed by the local Ollama installation from the
+     * configured Ollama models directory: manifest-registered models
+     * ({@code manifests/<registry>/<namespace>/<model>/<tag>} → model blob) plus
+     * bare {@code .gguf}/{@code .evo} artifacts at the directory root. Both the
+     * user-level ({@code ~/.ollama/models}) and the standard system-level
+     * ({@code /usr/share/ollama/.ollama/models}, Debian/Ubuntu Ollama package)
+     * locations are scanned so ENR sees the same models as the configured Ollama.
+     */
+    private List<StoredModel> discoverOllamaModels() {
+        List<StoredModel> models = new ArrayList<>();
+        for (Path ollamaDir : candidateOllamaDirs()) {
+            collectOllamaDir(ollamaDir, models);
+        }
+        return models;
+    }
+
+    /** Candidate Ollama model-storage directories: configured + standard system location. */
+    private List<Path> candidateOllamaDirs() {
+        List<Path> dirs = new ArrayList<>();
+        Path configured = config.ollamaModelsDir();
+        if (configured != null) {
+            dirs.add(configured);
+        }
+        // The Debian/Ubuntu Ollama package stores models under /usr/share/ollama;
+        // include that location as a fallback only when the configured directory
+        // is the default user location, so an explicit custom configuration (for
+        // example test isolation) is honoured exactly.
+        if (configured != null && configured.equals(defaultUserOllamaDir())) {
+            Path system = Path.of("/usr/share/ollama/.ollama/models");
+            if (Files.isDirectory(system) && !dirs.contains(system)) {
+                dirs.add(system);
+            }
+        }
+        return dirs;
+    }
+
+    private static Path defaultUserOllamaDir() {
+        return Path.of(System.getProperty("user.home"), ".ollama", "models");
+    }
+
+    private void collectOllamaDir(Path ollamaDir, List<StoredModel> models) {
+        if (ollamaDir == null || !Files.isDirectory(ollamaDir)) {
+            return;
+        }
+        Path manifestsDir = ollamaDir.resolve("manifests");
+        if (Files.isDirectory(manifestsDir)) {
+            try (Stream<Path> walk = Files.walk(manifestsDir)) {
+                for (Path manifest : walk.filter(Files::isRegularFile).toList()) {
+                    StoredModel model = ollamaManifestModel(manifestsDir, manifest, ollamaDir);
+                    if (model != null && models.stream().noneMatch(m -> m.id().equals(model.id()))) {
+                        models.add(model);
+                    }
+                }
+            } catch (IOException e) {
+                log.warn("model-store", "Failed to scan Ollama manifests " + manifestsDir + ": "
+                        + e.getMessage());
+            }
+        }
+        try (Stream<Path> stream = Files.list(ollamaDir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(p -> {
+                        String name = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                        return name.endsWith(".gguf") || name.endsWith(".evo");
+                    })
+                    .sorted()
+                    .forEach(file -> {
+                        String id = idFromFileName(file.getFileName().toString());
+                        if (models.stream().anyMatch(m -> m.id().equals(id))) {
+                            return;
+                        }
+                        models.add(new StoredModel(ModelManifest.of(id,
+                                file.getFileName().toString(), formatOf(file), "", safeSize(file),
+                                "ollama-local", safeMtime(file), file.getParent()),
+                                Files.isRegularFile(file)));
+                    });
+        } catch (IOException e) {
+            log.warn("model-store", "Failed to scan Ollama models directory " + ollamaDir + ": "
+                    + e.getMessage());
+        }
+    }
+
+    /** Resolves one Ollama manifest file into a model entry pointing at its model blob. */
+    private static StoredModel ollamaManifestModel(Path manifestsDir, Path manifest, Path ollamaDir) {
+        Path relative = manifestsDir.relativize(manifest);
+        int count = relative.getNameCount();
+        if (count < 3) {
+            return null;
+        }
+        String namespace = relative.getName(1).toString();
+        String model = relative.getName(count - 2).toString();
+        String tag = relative.getName(count - 1).toString();
+        String modelName = "library".equals(namespace)
+                ? model + ":" + tag
+                : namespace + "/" + model + ":" + tag;
+        String digest = modelLayerDigest(manifest);
+        if (digest == null || digest.isBlank()) {
+            return null;
+        }
+        Path blob = ollamaDir.resolve("blobs").resolve("sha256-" + digest);
+        if (!Files.isRegularFile(blob)) {
+            return null;
+        }
+        String id = sanitizeId(modelName);
+        ModelManifest manifestObj = ModelManifest.of(id, blob.getFileName().toString(), "gguf",
+                digest, safeSize(blob), "ollama-registry", safeMtime(blob), blob.getParent());
+        return new StoredModel(manifestObj, true);
+    }
+
+    /** The SHA-256 hex digest of a manifest's model layer (GGUF blob). */
+    private static String modelLayerDigest(Path manifestFile) {
+        try {
+            JsonObject obj = Json.parseObject(Files.readString(manifestFile));
+            JsonArray layers = obj.getArray("layers");
+            if (layers == null) {
+                return null;
+            }
+            for (int i = 0; i < layers.size(); i++) {
+                JsonObject layer = layers.getObject(i);
+                if (layer == null) {
+                    continue;
+                }
+                if (layer.getString("mediaType", "").contains("model")) {
+                    String digest = layer.getString("digest", "");
+                    return digest.startsWith("sha256:") ? digest.substring("sha256:".length())
+                            : digest;
+                }
+            }
+        } catch (Exception ignored) {
+            // unreadable or malformed manifest: skip this model
+        }
+        return null;
     }
 
     public StoredModel find(String id) {

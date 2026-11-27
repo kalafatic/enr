@@ -87,6 +87,14 @@ public final class TensorEntry {
         return store.loadFloats();
     }
 
+    /**
+     * Returns the underlying quantized weight if this tensor is stored in its
+     * original GGUF quantized form, otherwise {@code null}.
+     */
+    public ai.enr.core.tensor.QuantizedWeight quantizedWeight() {
+        return store == null ? null : store.quantizedWeight();
+    }
+
     public boolean isLoaded() {
         return store != null && store.isLoaded();
     }

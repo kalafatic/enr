@@ -13,15 +13,17 @@ import java.nio.charset.StandardCharsets;
 /**
  * Web Control Center: serves the static single-page UI from classpath
  * resources and exposes a small info endpoint. The UI is intentionally
- * dependency-free (vanilla HTML/CSS/JS); it talks to the same REST API as
- * every other client, so there is exactly one backend.
+ * dependency-free (vanilla HTML/CSS/JS); it talks to the ENR API over the
+ * authoritative API base URL (port 28780), never the Web listener itself.
  */
-final class WebUiHandler implements HttpHandler {
+public final class WebUiHandler implements HttpHandler {
 
     private final EnrManager manager;
+    private final String apiBaseUrl;
 
-    WebUiHandler(EnrManager manager) {
+    WebUiHandler(EnrManager manager, String apiBaseUrl) {
         this.manager = manager;
+        this.apiBaseUrl = apiBaseUrl;
     }
 
     @Override
@@ -33,6 +35,7 @@ final class WebUiHandler implements HttpHandler {
             info.put("version", "2.6.11");
             info.put("auth_required", !manager.config().authToken().isBlank());
             info.put("auth_ok", HttpSupport.authorized(exchange, manager.config().authToken()));
+            info.put("api_base_url", apiBaseUrl);
             HttpSupport.sendJson(exchange, 200, info);
             return;
         }

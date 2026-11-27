@@ -2,6 +2,7 @@ package ai.enr.inference;
 
 import ai.enr.compute.ComputeBackend;
 import ai.enr.core.tensor.FloatTensor;
+import ai.enr.core.tensor.QuantizedWeight;
 
 /**
  * Transformer executor implementing the verified EVO native semantics:
@@ -33,20 +34,11 @@ public final class Transformer {
         int heads = config.numHeads();
         int kvHeads = config.numKvHeads();
         int headDim = config.headDim();
+        int kvDim = kvHeads * headDim;
         int startPos = kvCache.size();
 
-        FloatTensor embeddings = weights.get("token_embd.weight");
-        float[] embData = embeddings.data();
-        int vocabSize = (int) embeddings.shape()[0];
-
         float[] x = new float[seqLen * dModel];
-        for (int r = 0; r < seqLen; r++) {
-            int id = ids[r];
-            if (id < 0 || id >= vocabSize) {
-                id = 1;
-            }
-            System.arraycopy(embData, id * dModel, x, r * dModel, dModel);
-        }
+        int vocabSize = embedTokens(ids, x);
 
         if (!config.usesRope()) {
             float[] pe = new float[seqLen * dModel];
@@ -60,20 +52,13 @@ public final class Transformer {
             String p = "blk." + b + ".";
             float[] attnNorm = weights.get(p + "attn_norm.weight").data();
             float[] ffnNorm = weights.get(p + "ffn_norm.weight").data();
-            float[] wq = weights.get(p + "attn_q.weight").data();
-            float[] wk = weights.get(p + "attn_k.weight").data();
-            float[] wv = weights.get(p + "attn_v.weight").data();
-            float[] wo = weights.get(p + "attn_output.weight").data();
-            float[] wg = weights.get(p + "ffn_gate.weight").data();
-            float[] wu = weights.get(p + "ffn_up.weight").data();
-            float[] wd = weights.get(p + "ffn_down.weight").data();
 
             FloatTensor xTensor = FloatTensor.of(x, seqLen, dModel);
             FloatTensor xn = backend.rmsNorm(xTensor, attnNorm, config.normEps());
 
-            FloatTensor q = backend.matmul(xn, FloatTensor.of(wq, dModel, dModel));
-            FloatTensor k = backend.matmul(xn, FloatTensor.of(wk, dModel, dModel));
-            FloatTensor v = backend.matmul(xn, FloatTensor.of(wv, dModel, dModel));
+            FloatTensor q = matmulWeight(xn, p + "attn_q.weight");
+            FloatTensor k = matmulWeight(xn, p + "attn_k.weight");
+            FloatTensor v = matmulWeight(xn, p + "attn_v.weight");
 
             float[] qd = q.data().clone();
             float[] kd = k.data().clone();
@@ -81,7 +66,7 @@ public final class Transformer {
 
             if (config.usesRope()) {
                 applyRope(qd, seqLen, heads, headDim, startPos);
-                applyRope(kd, seqLen, heads, headDim, startPos);
+                applyRope(kd, seqLen, kvHeads, headDim, startPos);
             }
 
             float[] kFlat = kvCache.keyCache(b);
@@ -102,9 +87,9 @@ public final class Transformer {
                                 values, targetOff, headDim);
                     } else {
                         int row = c - startPos;
-                        System.arraycopy(kd, row * dModel + kvHead * headDim,
+                        System.arraycopy(kd, row * kvDim + kvHead * headDim,
                                 keys, targetOff, headDim);
-                        System.arraycopy(vd, row * dModel + kvHead * headDim,
+                        System.arraycopy(vd, row * kvDim + kvHead * headDim,
                                 values, targetOff, headDim);
                     }
                 }
@@ -132,8 +117,8 @@ public final class Transformer {
                 }
             }
 
-            FloatTensor o = backend.matmul(FloatTensor.of(attnFlat, seqLen, dModel),
-                    FloatTensor.of(wo, dModel, dModel));
+            FloatTensor o = matmulWeight(FloatTensor.of(attnFlat, seqLen, dModel),
+                    p + "attn_output.weight");
             float[] xAfterAttn = new float[x.length];
             for (int i = 0; i < x.length; i++) {
                 xAfterAttn[i] = x[i] + o.data()[i];
@@ -141,10 +126,10 @@ public final class Transformer {
             x = xAfterAttn;
 
             FloatTensor xn2 = backend.rmsNorm(FloatTensor.of(x, seqLen, dModel), ffnNorm, config.normEps());
-            FloatTensor gate = backend.matmul(xn2, FloatTensor.of(wg, dModel, config.dff()));
-            FloatTensor up = backend.matmul(xn2, FloatTensor.of(wu, dModel, config.dff()));
+            FloatTensor gate = matmulWeight(xn2, p + "ffn_gate.weight");
+            FloatTensor up = matmulWeight(xn2, p + "ffn_up.weight");
             FloatTensor h = backend.siluMul(gate, up);
-            FloatTensor ffnOut = backend.matmul(h, FloatTensor.of(wd, config.dff(), dModel));
+            FloatTensor ffnOut = matmulWeight(h, p + "ffn_down.weight");
             float[] xAfterFfn = new float[x.length];
             for (int i = 0; i < x.length; i++) {
                 xAfterFfn[i] = x[i] + ffnOut.data()[i];
@@ -155,9 +140,9 @@ public final class Transformer {
             float[] kvValues = new float[seqLen * kvHeads * headDim];
             for (int kvHead = 0; kvHead < kvHeads; kvHead++) {
                 for (int r = 0; r < seqLen; r++) {
-                    System.arraycopy(kd, r * dModel + kvHead * headDim,
+                    System.arraycopy(kd, r * kvDim + kvHead * headDim,
                             kvKeys, r * kvHeads * headDim + kvHead * headDim, headDim);
-                    System.arraycopy(vd, r * dModel + kvHead * headDim,
+                    System.arraycopy(vd, r * kvDim + kvHead * headDim,
                             kvValues, r * kvHeads * headDim + kvHead * headDim, headDim);
                 }
             }
@@ -167,18 +152,62 @@ public final class Transformer {
         float[] outputNorm = weights.get("output_norm.weight").data();
         FloatTensor xn = backend.rmsNorm(FloatTensor.of(x, seqLen, dModel), outputNorm, config.normEps());
 
-        FloatTensor wout;
+        FloatTensor logits;
         if (config.embeddingTied()) {
-            FloatTensor emb = weights.get("token_embd.weight");
-            wout = FloatTensor.of(emb.data(), dModel, vocabSize);
+            QuantizedWeight embQ = weights.quantizedWeight("token_embd.weight");
+            if (embQ != null) {
+                logits = backend.matmulQuantized(xn, embQ);
+            } else {
+                FloatTensor emb = weights.get("token_embd.weight");
+                logits = backend.matmul(xn, FloatTensor.of(emb.data(), dModel, vocabSize));
+            }
         } else {
-            wout = weights.get("output.weight");
+            logits = matmulWeight(xn, "output.weight");
         }
-        FloatTensor logits = backend.matmul(xn, wout);
 
         float[] last = new float[vocabSize];
         System.arraycopy(logits.data(), (seqLen - 1) * vocabSize, last, 0, vocabSize);
         return last;
+    }
+
+    /** Fills {@code x} with the embedding rows for {@code ids}; returns vocab size. */
+    private int embedTokens(int[] ids, float[] x) {
+        int dModel = config.dModel();
+        QuantizedWeight embQ = weights.quantizedWeight("token_embd.weight");
+        if (embQ != null) {
+            int vocabSize = embQ.rows();
+            float[] row = new float[dModel];
+            for (int r = 0; r < ids.length; r++) {
+                int id = ids[r];
+                if (id < 0 || id >= vocabSize) {
+                    id = 1;
+                }
+                embQ.getRow(id, row);
+                System.arraycopy(row, 0, x, r * dModel, dModel);
+            }
+            return vocabSize;
+        }
+        FloatTensor embeddings = weights.get("token_embd.weight");
+        float[] embData = embeddings.data();
+        int vocabSize = (int) embeddings.shape()[0];
+        for (int r = 0; r < ids.length; r++) {
+            int id = ids[r];
+            if (id < 0 || id >= vocabSize) {
+                id = 1;
+            }
+            System.arraycopy(embData, id * dModel, x, r * dModel, dModel);
+        }
+        return vocabSize;
+    }
+
+    /** Matrix product against a weight, dispatching to the quantized path when stored quantized. */
+    private FloatTensor matmulWeight(FloatTensor x, String name) {
+        QuantizedWeight qw = weights.quantizedWeight(name);
+        if (qw != null) {
+            return backend.matmulQuantized(x, qw);
+        }
+        FloatTensor w = weights.get(name);
+        return backend.matmul(x, FloatTensor.of(w.data(), w.shape()[0], w.shape()[1]));
     }
 
     private void applyRope(float[] qkv, int seqLen, int heads, int headDim, int startPos) {

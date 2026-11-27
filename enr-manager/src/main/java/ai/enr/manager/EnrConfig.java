@@ -29,10 +29,17 @@ public record EnrConfig(
         String ollamaSearchUrl,
         String huggingFaceApiUrl,
         String huggingFaceToken,
+        Path ollamaModelsDir,
         long downloadTimeoutMs,
         JsonObject modelProviders,
         boolean webUiEnabled,
-        boolean webUiAutoStart) {
+        boolean webUiAutoStart,
+        int webPort) {
+
+    /** Authoritative ENR API port (headless runtime + all API surfaces). */
+    public static final int DEFAULT_API_PORT = 28780;
+    /** Authoritative ENR Web Control Center port (independent listener). */
+    public static final int DEFAULT_WEB_PORT = 28880;
 
     public static Builder builder() {
         return new Builder();
@@ -44,7 +51,8 @@ public record EnrConfig(
 
     public static final class Builder {
         private String host = "127.0.0.1";
-        private int port = 8111;
+        private int port = DEFAULT_API_PORT;
+        private int webPort = DEFAULT_WEB_PORT;
         private Path dataDir = Path.of(System.getProperty("user.home"), ".enr");
         private Path modelsDir = Path.of(System.getProperty("user.home"), ".enr", "models");
         private Path logDir = Path.of(System.getProperty("user.home"), ".enr", "logs");
@@ -61,6 +69,7 @@ public record EnrConfig(
         private String ollamaSearchUrl = "https://ollama.com";
         private String huggingFaceApiUrl = "https://huggingface.co";
         private String huggingFaceToken = "";
+        private Path ollamaModelsDir = defaultOllamaModelsDir();
         private long downloadTimeoutMs = 0;
         private JsonObject modelProviders = new JsonObject();
         private boolean webUiEnabled = true;
@@ -73,6 +82,11 @@ public record EnrConfig(
 
         public Builder port(int port) {
             this.port = port;
+            return this;
+        }
+
+        public Builder webPort(int webPort) {
+            this.webPort = webPort;
             return this;
         }
 
@@ -156,6 +170,11 @@ public record EnrConfig(
             return this;
         }
 
+        public Builder ollamaModelsDir(Path dir) {
+            this.ollamaModelsDir = dir == null ? defaultOllamaModelsDir() : dir;
+            return this;
+        }
+
         public Builder downloadTimeoutMs(long ms) {
             this.downloadTimeoutMs = ms;
             return this;
@@ -181,7 +200,17 @@ public record EnrConfig(
                     preferredBackend, allowCudaFallback, maxConcurrentSessions, defaultMaxTokens,
                     sessionIdleTimeoutSeconds, requestTimeoutSeconds, enableMetrics,
                     authToken, ollamaRegistryUrl, ollamaSearchUrl, huggingFaceApiUrl,
-                    huggingFaceToken, downloadTimeoutMs, modelProviders, webUiEnabled, webUiAutoStart);
+                    huggingFaceToken, ollamaModelsDir, downloadTimeoutMs, modelProviders,
+                    webUiEnabled, webUiAutoStart, webPort);
+        }
+
+        /** The default Ollama model storage directory (respects {@code OLLAMA_MODELS}). */
+        private static Path defaultOllamaModelsDir() {
+            String env = System.getenv("OLLAMA_MODELS");
+            if (env != null && !env.isBlank()) {
+                return Path.of(env.trim());
+            }
+            return Path.of(System.getProperty("user.home"), ".ollama", "models");
         }
     }
 }
