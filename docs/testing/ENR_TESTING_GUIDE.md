@@ -2,7 +2,7 @@
 
 How to start ENR, integrate it with OpenCode, and reproduce the functional test campaign documented in `ENR_INITIAL_TEST_REPORT.md`. All instructions are based on the verified environment:
 
-- ENR 2.6.11-SNAPSHOT at `/home/petr/git/enr-221126`, endpoint `http://127.0.0.1:8111`.
+- ENR 2.6.11-SNAPSHOT at `/home/petr/git/enr-221126`, endpoint `http://127.0.0.1:28780`.
 - JDK 25 (`/usr/lib/jvm/java-25-openjdk-amd64`) preferred for the CUDA backend; JDK 21 also works (CPU).
 - OpenCode **v2.4.0** (`/home/petr/.opencode/bin/opencode`).
 - Real Ollama 0.40.16 at `http://127.0.0.1:11434` (reference only).
@@ -28,9 +28,9 @@ Storage resolves under `~/.enr`. Local models come from `runtime.model_directori
 ## 2. Verify runtime readiness
 
 ```bash
-curl -s http://127.0.0.1:8111/api/version   # {"version":"2.6.11","name":"ENR"}
-curl -s http://127.0.0.1:8111/api/v1/status # {"running":true,...,"models_loaded":2}
-curl -s http://127.0.0.1:8111/api/v1/health # {"status":"healthy","checks":[]}
+curl -s http://127.0.0.1:28780/api/version   # {"version":"2.6.11","name":"ENR"}
+curl -s http://127.0.0.1:28780/api/v1/status # {"running":true,...,"models_loaded":2}
+curl -s http://127.0.0.1:28780/api/v1/health # {"status":"healthy","checks":[]}
 ```
 
 A startup message alone is not sufficient — confirm `/api/v1/status` reports `running: true`
@@ -43,9 +43,9 @@ and the expected `models_loaded` count.
 ./enr.sh ps                         # loaded models (name/parameters/size)
 ./enr.sh show tiny-evo              # model info: format/parameters/context/caps/model_info
 ./enr.sh version                    # runtime version
-curl -s http://127.0.0.1:8111/api/tags | python3 -m json.tool   # name/model/digest/details/capabilities
-curl -s http://127.0.0.1:8111/api/ps    | python3 -m json.tool   # loaded models + parameter_size
-curl -s -X POST http://127.0.0.1:8111/api/show -d '{"model":"tiny-evo"}'  # note: "model" (OpenCode format)
+curl -s http://127.0.0.1:28780/api/tags | python3 -m json.tool   # name/model/digest/details/capabilities
+curl -s http://127.0.0.1:28780/api/ps    | python3 -m json.tool   # loaded models + parameter_size
+curl -s -X POST http://127.0.0.1:28780/api/show -d '{"model":"tiny-evo"}'  # note: "model" (OpenCode format)
 ```
 
 `/api/show` must return `capabilities: ["completion"]` and `model_info.general.context_length`
@@ -97,11 +97,11 @@ Restart ENR; models are auto-loaded. To load/unload manually:
 # Native /api/v1 inference (raw prompt, requires the model to be loaded):
 ./enr.sh infer tiny-evo "hello"                 # -> token_4 (deterministic)
 ./enr.sh infer tiny-evo "hello" --max-tokens 1  # -> MAX_TOKENS_REACHED
-curl -s -X POST http://127.0.0.1:8111/api/v1/inference -d '{"model":"tiny-evo","prompt":"hello"}'
+curl -s -X POST http://127.0.0.1:28780/api/v1/inference -d '{"model":"tiny-evo","prompt":"hello"}'
 # -> {"text":"token_4","tokens":[4,2],"prompt_tokens":5,"generated_tokens":2,"reason":"EOS_REACHED",...}
 
 # Streaming (SSE):
-curl -s -N -X POST http://127.0.0.1:8111/api/v1/inference/stream -d '{"model":"tiny-evo","prompt":"hello"}'
+curl -s -N -X POST http://127.0.0.1:28780/api/v1/inference/stream -d '{"model":"tiny-evo","prompt":"hello"}'
 ```
 
 The bundled models are synthetic fixtures with a literal `token_N` vocabulary; output is
@@ -133,7 +133,7 @@ native `/api/*` discovery paths from it):
   "$schema": "https://opencode.ai/config.json",
   "providers": {
     "ollama": {
-      "settings": { "baseURL": "http://127.0.0.1:8111/v1" },
+      "settings": { "baseURL": "http://127.0.0.1:28780/v1" },
       "models": {
         "tiny-evo": {
           "name": "ENR tiny-evo (native)",
@@ -172,7 +172,7 @@ continue → final answer), all traffic through ENR.
     "enr": {
       "name": "ENR Gateway",
       "package": "@opencode/ai/providers/openai-compatible",
-      "settings": { "baseURL": "http://127.0.0.1:8111/v1" },
+      "settings": { "baseURL": "http://127.0.0.1:28780/v1" },
       "models": {
         "ds-flash": {
           "name": "DeepSeek Flash via ENR",
@@ -195,14 +195,14 @@ opencode run --auto -m enr/ds-flash "..."    # agentic coding task
 Verify the full lifecycle passed through ENR by checking the request log:
 
 ```bash
-curl -s http://127.0.0.1:8111/api/v1/logs | python3 -c \
+curl -s http://127.0.0.1:28780/api/v1/logs | python3 -c \
   'import sys,json; [print(e["message"]) for e in json.load(sys.stdin)["logs"] if e["logger"]=="chat"]'
 # expect: request model=deepseek:deepseek-flash target=provider provider=deepseek messages=N tools=M stream=true
 # with messages growing across turns (1,2,4,6,8,10...)
 ```
 
 The harness must not connect directly to the provider: here the `enr` provider only knows
-`127.0.0.1:8111`, and the model id `deepseek:deepseek-flash` is resolved by ENR's router.
+`127.0.0.1:28780`, and the model id `deepseek:deepseek-flash` is resolved by ENR's router.
 
 ## 9. Configure OpenCode with cloud DeepSeek
 
@@ -229,7 +229,7 @@ for this campaign (confirmed cloud, not local).
 ## 10. Execute native API tests
 
 ```bash
-B=http://127.0.0.1:8111
+B=http://127.0.0.1:28780
 curl -s $B/api/v1/health
 curl -s $B/api/v1/models            # loaded models: id/architecture/vocab_size/max_seq_len/backend
 curl -s $B/api/v1/devices          # CPU + CUDA devices
@@ -242,7 +242,7 @@ curl -s -X POST $B/api/v1/models/unload -d '{"id":"tiny-evo","force":false}'   #
 Reference contract: https://docs.ollama.com/api
 
 ```bash
-B=http://127.0.0.1:8111
+B=http://127.0.0.1:28780
 curl -s $B/api/version
 curl -s $B/api/tags
 curl -s $B/api/ps
@@ -262,7 +262,7 @@ curl -s -w '\n%{http_code}\n' -X POST $B/api/chat -d '{"model":"nope","messages"
 Requires a provider (Section 6). Example (Ollama wire format, non-streaming):
 
 ```bash
-B=http://127.0.0.1:8111
+B=http://127.0.0.1:28780
 TOOLS='[{"type":"function","function":{"name":"get_weather","description":"Get current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
 
 curl -s -X POST $B/api/chat -d "{\"model\":\"deepseek:deepseek-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Paris? Use the tool.\"}],\"tools\":$TOOLS,\"stream\":false}"

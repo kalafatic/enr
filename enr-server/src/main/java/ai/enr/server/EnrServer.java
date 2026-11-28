@@ -63,11 +63,7 @@ public final class EnrServer implements AutoCloseable {
         registerFamilyRoutes();
         if (manager != null) {
             registerManagerRoutes();
-            if (manager.config().webUiEnabled() && manager.config().webUiAutoStart()) {
-                server.createContext("/", new WebUiHandler(manager));
-            } else {
-                server.createContext("/", new RootHandler(manager.config().webUiEnabled()));
-            }
+            server.createContext("/", new RootHandler(manager.config().webUiEnabled()));
         } else {
             server.createContext("/", new RootHandler(false));
         }

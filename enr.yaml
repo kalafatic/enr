@@ -1,11 +1,12 @@
 server:
   host: 127.0.0.1
-  port: 8111
+  port: 28780
   # auth_token: ""            # optional Bearer token protecting the admin API + Web UI
 
 web_server:
-  enabled: true               # serve the Web Control Center at /
+  enabled: true               # serve the Web Control Center on the independent web listener
   auto_start: true            # register the Web Control Center when the server starts
+  port: 28880                # independent Web UI listener (never the API port)
 
 runtime:
   preferred_backend: cpu      # cpu | cuda (cuda falls back to cpu unless allow_cuda_fallback: false)

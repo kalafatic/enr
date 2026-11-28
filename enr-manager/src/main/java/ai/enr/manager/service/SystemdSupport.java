@@ -98,7 +98,11 @@ public final class SystemdSupport {
         String content = """
                 server:
                   host: 0.0.0.0
-                  port: 8111
+                  port: 28780
+                web_server:
+                  enabled: true
+                  auto_start: true
+                  port: 28880
                 runtime:
                   preferred_backend: cpu
                   allow_cuda_fallback: true

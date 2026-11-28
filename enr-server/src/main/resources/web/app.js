@@ -1,5 +1,8 @@
-/* ENR Control Center — vanilla JS SPA. Talks to the same REST API as every client. */
+/* ENR Control Center — vanilla JS SPA. Talks to the ENR API over api_base_url. */
 "use strict";
+
+// Base URL of the ENR API listener (port 28780); injected from /api/wcc/info.
+let API_BASE = "";
 
 const state = {
   token: localStorage.getItem("enr_token") || "",
@@ -31,7 +34,7 @@ function authHeaders() {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(API_BASE + path, {
     method: opts.method || (opts.body ? "POST" : "GET"),
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
@@ -1070,6 +1073,7 @@ function diagTab(tab, btn) {
 async function boot() {
   try {
     const info = await fetch("/api/wcc/info").then(r => r.json());
+    if (info.api_base_url) API_BASE = info.api_base_url;
     if (info.auth_required) $("#token-btn").classList.remove("hidden");
     if (info.auth_required && !info.auth_ok && !state.token) promptToken();
   } catch { /* server not reachable */ }
@@ -1103,7 +1107,7 @@ async function boot() {
 async function ping() {
   const dot = $("#conn-dot");
   try {
-    const res = await fetch("/api/v1/health");
+    const res = await fetch(API_BASE + "/api/v1/health");
     dot.className = "dot " + (res.ok ? "ok" : "");
   } catch { dot.className = "dot"; }
 }

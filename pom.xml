@@ -14,7 +14,7 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <maven.compiler.release>21</maven.compiler.release>
+    <maven.compiler.release>25</maven.compiler.release>
     <junit.version>5.10.2</junit.version>
     <enr.version>2.6.11-SNAPSHOT</enr.version>
   </properties>
@@ -122,7 +122,7 @@
           <artifactId>maven-compiler-plugin</artifactId>
           <version>3.13.0</version>
           <configuration>
-            <release>21</release>
+            <release>25</release>
           </configuration>
         </plugin>
         <plugin>

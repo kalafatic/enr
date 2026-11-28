@@ -40,6 +40,17 @@ public final class ModelWeights {
         }
     }
 
+    /**
+     * Returns the quantized weight for a tensor if it is stored in its original
+     * GGUF quantized form, otherwise {@code null} (F32 path). Quantized weights
+     * are not F32-expanded and are not cached here.
+     */
+    public ai.enr.core.tensor.QuantizedWeight quantizedWeight(String name) {
+        TensorEntry entry = model.tensor(name).orElseThrow(
+                () -> new IllegalStateException("Missing tensor: " + name + " in model " + model.name()));
+        return entry.quantizedWeight();
+    }
+
     public LoadedModel model() {
         return model;
     }

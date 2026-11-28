@@ -19,9 +19,9 @@ mvn clean package            # runs tests; append -DskipTests to skip
 
 ```bash
 ./enr.sh serve -c enr.yaml                 # server + Web Control Center
-# http://127.0.0.1:8111/                   Web UI
-# http://127.0.0.1:8111/api                Ollama-compatible API
-# http://127.0.0.1:8111/v1                 OpenAI-compatible API
+# http://127.0.0.1:28780/                   Web UI
+# http://127.0.0.1:28780/api                Ollama-compatible API
+# http://127.0.0.1:28780/v1                 OpenAI-compatible API
 ```
 
 `enr start` behaves identically but writes `/tmp/enr.pid`; `enr stop` stops it.
@@ -72,7 +72,7 @@ sudo systemctl enable enr        # already enabled by install; starts at boot
 
 - Unit: `/etc/systemd/system/enr.service` (`Restart=on-failure`, `RestartSec=5`, SIGTERM graceful
   shutdown with model unloading, log append to `/var/log/enr`, `multi-user.target`)
-- Config: `/etc/enr/enr.yaml` (created from a system template: binds `0.0.0.0:8111`,
+- Config: `/etc/enr/enr.yaml` (created from a system template: binds `0.0.0.0:28780`,
   models at `/var/lib/enr/models`, logs at `/var/log/enr`)
 - Remove: `sudo ./enr.sh service uninstall`; inspect: `enr service unit | systemd-analyze verify`
 - Health endpoint for monitoring: `GET /api/v1/health` → 200 healthy / 503 with checks
@@ -85,7 +85,7 @@ browser never terminates inference; the UI talks to the same REST API as every o
 ```yaml
 server:
   host: 127.0.0.1
-  port: 8111
+  port: 28780
   auth_token: ""              # optional Bearer token for the admin API + Web UI
 
 runtime:

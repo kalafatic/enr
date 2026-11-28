@@ -168,6 +168,7 @@ class ManagerTest extends ManagerTestBase {
                 .dataDir(tempDir.resolve("data2"))
                 .modelsDir(tempDir.resolve("models2"))
                 .logDir(tempDir.resolve("logs2"))
+                .ollamaModelsDir(tempDir.resolve("ollama-models"))
                 .authToken("secret-token")
                 .build();
         manager = new EnrManager(config);
@@ -269,6 +270,7 @@ class ManagerTest extends ManagerTestBase {
                     .dataDir(tempDir.resolve("data3"))
                     .modelsDir(tempDir.resolve("models3"))
                     .logDir(tempDir.resolve("logs3"))
+                    .ollamaModelsDir(tempDir.resolve("ollama-models"))
                     .ollamaRegistryUrl("http://127.0.0.1:" + registry.getAddress().getPort())
                     .ollamaSearchUrl("http://127.0.0.1:" + registry.getAddress().getPort())
                     .huggingFaceApiUrl("http://127.0.0.1:" + registry.getAddress().getPort())

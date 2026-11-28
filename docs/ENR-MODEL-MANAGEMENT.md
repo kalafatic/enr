@@ -100,7 +100,7 @@ plus `FAILED`, `CANCEL_REQUESTED`, `CANCELLED`.
 ## 5. Java API (EnrClient)
 
 ```java
-EnrClient client = new EnrClient("http://127.0.0.1:8111");
+EnrClient client = new EnrClient("http://127.0.0.1:28780");
 
 EnrClient.ModelJob job = client.pullModel("ollama", "qwen3-vl:30b");
 // -> job.jobId(), job.provider(), job.model(), job.status()

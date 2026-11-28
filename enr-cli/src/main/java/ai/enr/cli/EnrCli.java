@@ -7,8 +7,10 @@ import ai.enr.core.json.JsonObject;
 import ai.enr.manager.EnrConfig;
 import ai.enr.manager.EnrConfigLoader;
 import ai.enr.manager.EnrManager;
+import ai.enr.manager.logs.LoggingConfig;
 import ai.enr.manager.service.SystemdSupport;
 import ai.enr.server.EnrServer;
+import ai.enr.server.EnrWebServer;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -44,8 +46,15 @@ public final class EnrCli {
     private static final Logger LOG = Logger.getLogger("ai.enr");
 
     public static void main(String[] args) {
-        configureLogging();
-        int exit = new EnrCli().run(args);
+        if (LoggingConfig.conflicting(args)) {
+            System.err.println("ERROR: --logging and --no-logging are mutually exclusive");
+            System.exit(2);
+            return;
+        }
+        // --no-logging suppresses routine application logging but keeps errors
+        // (SEVERE) on stderr. --logging (and the default) enable INFO logging.
+        configureLogging(LoggingConfig.level(args));
+        int exit = new EnrCli().run(LoggingConfig.strip(args));
         System.exit(exit);
     }
 
@@ -153,7 +162,8 @@ public final class EnrCli {
                 return 1;
             }
             System.out.println("Installing ENR as a service...");
-            ServiceManager.install(jar, "127.0.0.1", 8111);
+
+            ServiceManager.install(jar, "127.0.0.1", EnrConfig.DEFAULT_API_PORT);
             return 0;
         } catch (Exception e) {
             System.err.println("Installation failed: " + e.getMessage());
@@ -362,10 +372,19 @@ public final class EnrCli {
         autoLoad(manager);
         EnrServer server = new EnrServer(manager, config.host(), config.port());
         server.start();
-        System.out.println("ENR server started on " + config.host() + ":" + server.port());
-        System.out.println("  Web Control Center: http://" + displayHost(config.host()) + ":" + server.port() + "/");
+        System.out.println("ENR API server started on " + config.host() + ":" + server.port());
         System.out.println("  Ollama API:        http://" + displayHost(config.host()) + ":" + server.port() + "/api");
         System.out.println("  OpenAI API:        http://" + displayHost(config.host()) + ":" + server.port() + "/v1");
+        System.out.println("  Native ENR API:    http://" + displayHost(config.host()) + ":" + server.port() + "/enr/v1");
+
+        EnrWebServer webServer = null;
+        if (config.webUiEnabled() && config.webUiAutoStart()) {
+            webServer = new EnrWebServer(manager, config.host(), config.webPort(),
+                    config.host(), config.port());
+            webServer.start();
+            System.out.println("ENR Web server started on " + config.host() + ":" + webServer.port());
+            System.out.println("  Web Control Center: http://" + displayHost(config.host()) + ":" + webServer.port() + "/");
+        }
 
         Path pidFile = Path.of("/tmp/enr.pid");
         if (writePidFile) {
@@ -376,9 +395,13 @@ public final class EnrCli {
             }
         }
 
+        final EnrWebServer web = webServer;
         CountDownLatch latch = new CountDownLatch(1);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Shutting down ENR (unloading models)...");
+            if (web != null) {
+                web.close();
+            }
             server.close();
             manager.close();
             if (writePidFile) {
@@ -1089,7 +1112,7 @@ public final class EnrCli {
                     System.err.println("JAR not found: " + jarPath + " (run mvn package first, or pass --jar)");
                     yield 1;
                 }
-                ServiceManager.install(jarPath, "127.0.0.1", 8111);
+                ServiceManager.install(jarPath, "127.0.0.1", EnrConfig.DEFAULT_API_PORT);
                 yield 0;
             }
             case "uninstall" -> {
@@ -1229,7 +1252,7 @@ public final class EnrCli {
                 url = args[++i];
             }
         }
-        String base = url != null ? url : "http://127.0.0.1:8111";
+        String base = url != null ? url : "http://127.0.0.1:" + EnrConfig.DEFAULT_API_PORT;
         return java.util.Optional.of(new EnrClient(base));
     }
 
@@ -1250,6 +1273,10 @@ public final class EnrCli {
     private static void printUsage() {
         System.out.println("""
                 ENR — Native AI Model Inference Runtime & Control Center
+
+                Global options:
+                  --logging                                          enable application logging (INFO)
+                  --no-logging                                       disable routine logging (errors only)
 
                 Server:
                   enr serve [-c config.yaml] [-p port] [-H host] [--cuda|--cpu]    foreground server
@@ -1295,13 +1322,13 @@ public final class EnrCli {
                 """);
     }
 
-    private static void configureLogging() {
+    private static void configureLogging(Level level) {
         Logger root = Logger.getLogger("");
         for (java.util.logging.Handler handler : root.getHandlers()) {
             root.removeHandler(handler);
         }
         ConsoleHandler handler = new ConsoleHandler();
-        handler.setLevel(Level.INFO);
+        handler.setLevel(level);
         handler.setFormatter(new Formatter() {
             @Override
             public String format(LogRecord record) {
@@ -1310,6 +1337,6 @@ public final class EnrCli {
             }
         });
         root.addHandler(handler);
-        root.setLevel(Level.INFO);
+        root.setLevel(level);
     }
 }

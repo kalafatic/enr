@@ -31,7 +31,7 @@ public record RuntimeConfig(
 
     public static final class Builder {
         private String host = "127.0.0.1";
-        private int port = 8111;
+        private int port = 28780;
         private final List<Path> modelDirectories = new ArrayList<>();
         private String preferredBackend = "cpu";
         private boolean allowCudaFallback = true;

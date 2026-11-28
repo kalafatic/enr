@@ -33,7 +33,7 @@ Center, a CLI and systemd integration.
 ```bash
 export JAVA_HOME=/usr/lib/jvm/java-25-openjdk-amd64   # JDK 25 (CUDA) or 21 (CPU-only)
 mvn clean install
-./enr.sh serve -c enr.yaml                            # server + Web UI on http://127.0.0.1:8111/
+./enr.sh serve -c enr.yaml                            # server + Web UI on http://127.0.0.1:28780/
 
 ./enr.sh pull tinyllama                               # download from the Ollama Library
 ./enr.sh pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
